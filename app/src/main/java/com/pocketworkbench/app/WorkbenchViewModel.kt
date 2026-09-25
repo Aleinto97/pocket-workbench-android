@@ -54,7 +54,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     // llama.cpp #28878 (SIGSEGV in CPU path with 6+ threads on Android/aarch64):
     // default 4 compute threads, user-tunable in Models > Compute threads.
     var genThreads by androidx.compose.runtime.mutableStateOf(config.getInt("gen_threads", 4)); private set
-    fun setGenThreads(n: Int) {
+    fun applyGenThreads(n: Int) {
         genThreads = n.coerceIn(1, 8)
         config.edit().putInt("gen_threads", genThreads).apply()
         Diag.log("config", "gen_threads=$genThreads")

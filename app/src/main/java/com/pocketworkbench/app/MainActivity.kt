@@ -239,7 +239,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                     style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
                     listOf(1, 2, 3, 4, 6, 8).forEach { n ->
-                        FilterChip(selected = vm.genThreads == n, onClick = { vm.setGenThreads(n) }, label = { Text("$n") })
+                        FilterChip(selected = vm.genThreads == n, onClick = { vm.applyGenThreads(n) }, label = { Text("$n") })
                     }
                 }
             }
