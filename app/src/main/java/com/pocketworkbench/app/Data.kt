@@ -91,7 +91,7 @@ class HubClient {
         if (existing > 0) builder.header("Range", "bytes=$existing-")
         client.newCall(builder.build()).execute().use { response ->
             if (response.code !in listOf(200, 206)) throw IOException("Download failed: HTTP ${response.code}")
-            if (existing > 0 && response.code == 206 && !response.header("Content-Range", "").startsWith("bytes $existing-")) throw IOException("Server returned a mismatched byte range")
+            if (existing > 0 && response.code == 206 && !response.header("Content-Range").orEmpty().startsWith("bytes $existing-")) throw IOException("Server returned a mismatched byte range")
             val append = existing > 0 && response.code == 206
             val initial = if (append) existing else 0L
             val contentLength = response.body?.contentLength() ?: -1L
