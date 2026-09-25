@@ -10,12 +10,31 @@ android {
         applicationId = "com.pocketworkbench.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.2.1"
+        versionCode = 4
+        versionName = "0.2.2"
         ndk { abiFilters += "arm64-v8a" }
         externalNativeBuild { cmake { cppFlags += "-std=c++17"; arguments += listOf("-DGGML_NATIVE=OFF", "-DGGML_OPENMP=OFF", "-DGGML_LLAMAFILE=OFF", "-DLLAMA_OPENSSL=OFF", "-DGGML_VULKAN=${if (providers.gradleProperty("gpu").orNull == "true") "ON" else "OFF"}") } }
     }
     buildFeatures { compose = true }
+    // Stable signing key committed in the private repo: every CI build is signed
+    // identically so new APKs install as UPDATES over previous ones (model files
+    // in filesDir survive). Without this, each CI runner generated a fresh debug
+    // key and users had to uninstall (losing downloaded models) for every update.
+    signingConfigs {
+        create("stable") {
+            storeFile = file("pocketworkbench.keystore")
+            storePassword = "pocketworkbench2026"
+            keyAlias = "pocketworkbench"
+            keyPassword = "pocketworkbench2026"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("stable") }
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("stable")
+        }
+    }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }

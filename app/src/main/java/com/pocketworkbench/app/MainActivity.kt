@@ -294,6 +294,54 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             item {
                 Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Terminal, null, tint = Indigo, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("DIAGNOSTICS", style = MaterialTheme.typography.labelMedium, color = Indigo, modifier = Modifier.weight(1f))
+                            Text("App ${vm.appVersion()}", style = MaterialTheme.typography.labelSmall, color = Color.LightGray)
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(vm.diagSessionInfo(), style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                        vm.diagPreviousEnd()?.let { note ->
+                            Spacer(Modifier.height(8.dp))
+                            Surface(color = Color(0xFF3A3424), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                Text("⚠ $note", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFD9A0), modifier = Modifier.padding(10.dp))
+                            }
+                        }
+                        vm.diagLastCrash()?.let { crash ->
+                            Spacer(Modifier.height(8.dp))
+                            Surface(color = Color(0xFF3A2430), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(10.dp)) {
+                                    Text("LAST SESSION CRASHED", style = MaterialTheme.typography.labelSmall, color = Color(0xFFFFB4A0))
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(crash, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Color(0xFFFFB4A0))
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Text("RECENT EVENTS (latest 40)", style = MaterialTheme.typography.labelSmall, color = Indigo)
+                        Surface(color = Console, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                            Column(Modifier.padding(8.dp)) {
+                                if (vm.diagRecent.isEmpty()) Text("No events yet.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                                vm.diagRecent.forEach { line ->
+                                    Text(line, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Color(0xFF9FB2CC), fontSize = 9.sp)
+                                }
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
+                            OutlinedButton(onClick = {
+                                clipboard.setText(AnnotatedString(vm.exportDiag()))
+                                Toast.makeText(context, "Diagnostics copied", Toast.LENGTH_SHORT).show()
+                            }) { Icon(Icons.Default.ContentCopy, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("Copy diagnostics") }
+                            OutlinedButton(onClick = { vm.clearDiag() }) { Icon(Icons.Default.DeleteSweep, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("Clear") }
+                        }
+                        Text("If a generation ends with the app disappearing, copy this and the performance log and send both.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    }
+                }
+            }
+            item {
+                Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
                         Text("DEVICE", style = MaterialTheme.typography.labelMedium, color = Indigo)
                         Spacer(Modifier.height(6.dp))
                         Text(vm.deviceSummary(), style = MaterialTheme.typography.bodyMedium)

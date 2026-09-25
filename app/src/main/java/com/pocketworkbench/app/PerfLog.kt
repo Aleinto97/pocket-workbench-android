@@ -29,7 +29,11 @@ data class PerfEntry(
     val android: String,
     val totalRamMb: Long,
     val freeRamMb: Long,
-    val problem: String
+    val problem: String,
+    val ttftMs: Double = 0.0,
+    val pssMb: Int = 0,
+    val thermal: String = "",
+    val foreground: Boolean = true
 ) {
     val genTps: Double get() = if (genMs > 0) genTokens / (genMs / 1000.0) else 0.0
     val prefillTps: Double get() = if (prefillMs > 0) prefillTokens / (prefillMs / 1000.0) else 0.0
@@ -37,6 +41,7 @@ data class PerfEntry(
         val parts = mutableListOf<String>()
         if (genTps > 0) parts.add(String.format(Locale.US, "%.1f tok/s", genTps))
         if (genTokens > 0) parts.add("$genTokens tok")
+        if (ttftMs > 0) parts.add(String.format(Locale.US, "%.1fs to 1st", ttftMs / 1000.0))
         if (!cached && loadMs > 0) parts.add(String.format(Locale.US, "load %.1fs", loadMs / 1000.0))
         if (parts.isEmpty()) return backend
         return parts.joinToString(" · ") + " · $backend"
@@ -44,12 +49,15 @@ data class PerfEntry(
     fun row(): String {
         val time = SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(timestamp))
         val load = if (cached) "cached" else String.format(Locale.US, "%.1fs", loadMs / 1000.0)
+        val ttft = if (ttftMs > 0) String.format(Locale.US, "%.1fs", ttftMs / 1000.0) else "-"
         val flags = buildList {
             if (gpuFallback) add("GPU-fallback")
             if (cached) add("model-cached")
+            if (!foreground) add("backgrounded")
+            if (thermal.isNotBlank() && thermal != "none") add("thermal=$thermal")
         }.joinToString(",")
-        return String.format(Locale.US, "| %s | %s | %s | %s | %.0f | %.1f | %d | %s | %s | %s |",
-            time, model.take(28), backend, load, prefillTps, genTps, genTokens, threads, stop, flags.ifEmpty { "-" })
+        return String.format(Locale.US, "| %s | %s | %s | %s | %.0f | %.1f | %d | %s | %s | %s | %s |",
+            time, model.take(28), backend, load, prefillTps, genTps, genTokens, ttft, threads, stop, flags.ifEmpty { "-" })
     }
 }
 
@@ -100,6 +108,10 @@ class PerfLog(private val context: Context) {
             else -> {}
         }
         if (e.genTps in 0.01..1.0) issues.add(String.format(Locale.US, "Very low generation speed (%.2f tok/s)", e.genTps))
+        if (e.ttftMs > 8000) issues.add(String.format(Locale.US, "Slow first token (TTFT %.1fs incl. model load)", e.ttftMs / 1000.0))
+        if (!e.foreground) issues.add("Run ended while the app was in the background")
+        if (e.thermal in listOf("severe", "critical", "emergency", "shutdown")) issues.add("Thermal throttling (${e.thermal})")
+        if (e.pssMb > 3500) issues.add("High app memory footprint (${e.pssMb} MB PSS)")
         if (e.freeRamMb < 800) issues.add("Low free memory at run time (${e.freeRamMb} MB)")
         return issues.joinToString("; ")
     }
@@ -116,7 +128,11 @@ class PerfLog(private val context: Context) {
             stop = stats.optString("stop", "unknown"),
             deviceModel = snap.model, soc = snap.soc, android = snap.android,
             totalRamMb = snap.totalRamMb, freeRamMb = snap.freeRamMb,
-            problem = ""
+            problem = "",
+            ttftMs = if (stats.has("ttft_ms")) stats.optDouble("ttft_ms", 0.0) else 0.0,
+            pssMb = stats.optInt("pss_mb", 0),
+            thermal = stats.optString("thermal", ""),
+            foreground = stats.optBoolean("fg", true)
         )
         val withProblem = entry.copy(problem = detectProblem(entry))
         add(withProblem)
@@ -133,7 +149,8 @@ class PerfLog(private val context: Context) {
                     .put("gpu_fallback", e.gpuFallback).put("p_tokens", e.prefillTokens).put("p_ms", e.prefillMs)
                     .put("g_tokens", e.genTokens).put("g_ms", e.genMs).put("stop", e.stop)
                     .put("device", e.deviceModel).put("soc", e.soc).put("android", e.android)
-                    .put("ram_total", e.totalRamMb).put("ram_free", e.freeRamMb).put("problem", e.problem))
+                    .put("ram_total", e.totalRamMb).put("ram_free", e.freeRamMb).put("problem", e.problem)
+                    .put("ttft", e.ttftMs).put("pss", e.pssMb).put("thermal", e.thermal).put("fg", e.foreground))
             }
             val temp = File(file.parentFile, "perf_log.tmp")
             temp.writeText(array.toString())
@@ -156,7 +173,9 @@ class PerfLog(private val context: Context) {
                     stop = o.optString("stop", "unknown"), deviceModel = o.optString("device"),
                     soc = o.optString("soc"), android = o.optString("android"),
                     totalRamMb = o.optLong("ram_total"), freeRamMb = o.optLong("ram_free"),
-                    problem = o.optString("problem")
+                    problem = o.optString("problem"),
+                    ttftMs = o.optDouble("ttft", 0.0), pssMb = o.optInt("pss", 0),
+                    thermal = o.optString("thermal"), foreground = o.optBoolean("fg", true)
                 )
             }.forEach { entries.add(it) }
         } catch (_: Exception) {}
@@ -170,9 +189,11 @@ class PerfLog(private val context: Context) {
         sb.appendLine("Exported: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())}")
         sb.appendLine("Runs recorded: ${entries.size}")
         sb.appendLine()
-        sb.appendLine("| time | model | backend | load | prefill tok/s | gen tok/s | gen tok | threads | stop | flags |")
-        sb.appendLine("|---|---|---|---|---|---|---|---|---|---|")
+        sb.appendLine("| time | model | backend | load | prefill tok/s | gen tok/s | gen tok | ttft | threads | stop | flags |")
+        sb.appendLine("|---|---|---|---|---|---|---|---|---|---|---|")
         entries.forEach { sb.appendLine(it.row()) }
+        val ttfts = entries.map { it.ttftMs }.filter { it > 0 }
+        if (ttfts.isNotEmpty()) sb.appendLine(String.format(Locale.US, "Average time to first token: %.1fs", ttfts.average() / 1000.0))
         val problems = entries.filter { it.problem.isNotBlank() }
         if (problems.isNotEmpty()) {
             sb.appendLine()

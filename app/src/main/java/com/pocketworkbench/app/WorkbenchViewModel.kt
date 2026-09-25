@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.compose.runtime.getValue
@@ -55,11 +56,20 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private var recording: Job? = null
     private var recorder: AudioRecord? = null
     private val pending = mutableSetOf<String>()
+
+    // ---------- Diagnostics: shared generation tracking ----------
+    private val logDir: String by lazy { File(getApplication<Application>().filesDir, "logs").apply { mkdirs() }.absolutePath }
+    private var genStartMs = 0L
+    private var firstTokenMs = 0L
+    private var tokenCount = 0
+    private var lastUiFlushMs = 0L
+
     init {
-        conversations.addAll(store.readHistory())
+        conversations.addAll(sanitizeHistory(store.readHistory()))
         if (conversations.isEmpty()) conversations.add(store.newChat())
         activeId = conversations.first().id
         refresh()
+        Diag.log("vm", "init: ${conversations.size} chats, ${installed.size} models, agent=$agentMode, app=${Diag.appVersion()}")
         gh.token()?.let {
             viewModelScope.launch {
                 try {
@@ -84,7 +94,25 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         if (!model.file.delete()) { status = "Could not delete model"; return }
         refresh(); status = "Deleted ${model.name}"
     }
-    private fun persist() { store.saveHistory(conversations.toList()) }
+    private fun persist() {
+        // Trim trailing empty assistant placeholders before saving: a process death
+        // mid-generation used to leave a permanent "Thinking…" bubble after restart.
+        val cleaned = conversations.map { c ->
+            val msgs = c.messages.toMutableList()
+            while (msgs.isNotEmpty() && msgs.last().role == "assistant" && msgs.last().text.isBlank() && msgs.last().perf.isBlank()) msgs.removeAt(msgs.lastIndex)
+            c.copy(messages = msgs)
+        }
+        try { store.saveHistory(cleaned) } catch (e: Exception) { Diag.log("persist", "saveHistory FAILED: ${e.message}") }
+    }
+
+    /** Drop trailing empty assistant placeholders from loaded history and mark old
+     *  mid-history empties clearly (they were silent "Thinking…" zombies). */
+    private fun sanitizeHistory(chats: List<Conversation>): List<Conversation> = chats.map { c ->
+        val msgs = c.messages.toMutableList()
+        while (msgs.isNotEmpty() && msgs.last().role == "assistant" && msgs.last().text.isBlank() && msgs.last().perf.isBlank()) msgs.removeAt(msgs.lastIndex)
+        val marked = msgs.map { if (it.role == "assistant" && it.text.isBlank()) it.copy(text = "(generation interrupted)") else it }
+        c.copy(messages = marked.toMutableList())
+    }
 
     // ---------- GitHub sign-in (OAuth Device Flow) ----------
     fun saveGhClientId(value: String) {
@@ -127,6 +155,15 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         config.edit().putBoolean("agent_mode", agentMode).apply()
         if (agentMode && !ghLoggedIn) status = "Agent mode on: sign in on the GitHub page to enable tools"
     }
+
+    // ---------- Diagnostics API (Stats page) ----------
+    val diagRecent: List<String> get() = Diag.recent(40)
+    fun diagSessionInfo(): String = Diag.sessionInfo
+    fun diagLastCrash(): String? = Diag.lastCrashReport
+    fun diagPreviousEnd(): String? = Diag.previousEndSummary
+    fun appVersion(): String = Diag.appVersion()
+    fun exportDiag(): String = Diag.snapshot()
+    fun clearDiag() { Diag.clearCrashMarkers(); status = "Diagnostics cleared" }
 
     // ---------- Performance log ----------
     val perfEntries: List<PerfEntry> get() = perf.entries
@@ -186,13 +223,24 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     }
     private fun streamAbsolute(chatId: String, replyIndex: Int, buffer: StringBuilder) {
         viewModelScope.launch(Dispatchers.Main) {
-            updateChat(chatId) { chat ->
-                if (chat.messages.size > replyIndex) {
-                    val messages = chat.messages.toMutableList()
-                    messages[replyIndex] = messages[replyIndex].copy(text = buffer.toString())
-                    chat.copy(messages = messages)
-                } else chat
-            }
+            flushBuffer(chatId, replyIndex, buffer)
+        }
+    }
+    // Throttled streaming: per-token Main-thread updates used to storm the UI
+    // (one coroutine launch per token). Now at most ~11 updates/sec.
+    private fun streamThrottled(chatId: String, replyIndex: Int, buffer: StringBuilder) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastUiFlushMs < 90 && tokenCount % 8 != 0) return
+        lastUiFlushMs = now
+        streamAbsolute(chatId, replyIndex, buffer)
+    }
+    private fun flushBuffer(chatId: String, replyIndex: Int, buffer: StringBuilder) {
+        updateChat(chatId) { chat ->
+            if (chat.messages.size > replyIndex) {
+                val messages = chat.messages.toMutableList()
+                messages[replyIndex] = messages[replyIndex].copy(text = buffer.toString())
+                chat.copy(messages = messages)
+            } else chat
         }
     }
     private fun attachPerf(chatId: String, replyIndex: Int, chip: String) {
@@ -225,13 +273,38 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         started.messages.add(ChatMessage("assistant", ""))
         conversations[idx] = started.copy(messages = started.messages.toMutableList(), model = model.name)
         persist()
+        genStartMs = SystemClock.elapsedRealtime(); firstTokenMs = 0L; tokenCount = 0; lastUiFlushMs = 0L
+        Diag.log("chat", "send: model=${model.name} chars=${text.trim().length} agent=$useAgent replyIndex=$replyIndex")
+        Diag.updateState("generating", "model=${model.name}")
         busy = true; toolStatus = ""
         status = if (useAgent) "Agent: thinking…" else "Generating locally…"
         generation = viewModelScope.launch(Dispatchers.IO) {
+            val heartbeat = startHeartbeat(model.name)
             try {
                 if (useAgent) runAgentTurn(chat.id, model) else runLocalTurn(chat.id, model)
-            } catch (e: Exception) { withContext(Dispatchers.Main) { status = e.message ?: "Generation failed" } }
-            finally { withContext(Dispatchers.Main) { busy = false; delay(120); persist() } }
+                Diag.updateState("idle", "turn complete")
+            } catch (e: Exception) {
+                Diag.log("gen", "turn FAILED: ${e.javaClass.simpleName}: ${e.message}")
+                withContext(Dispatchers.Main) { status = e.message ?: "Generation failed" }
+            }
+            finally {
+                heartbeat.cancel()
+                withContext(Dispatchers.Main) { busy = false; delay(120) }
+                persist()
+                Diag.log("chat", "turn finished: tokens=$tokenCount ttft=${firstTokenMs}ms")
+            }
+        }
+    }
+
+    // While generating: periodic liveness + memory evidence, plus a periodic
+    // history save so even a hard crash keeps the partial response on disk.
+    private fun startHeartbeat(modelName: String): Job = viewModelScope.launch(Dispatchers.IO) {
+        while (true) {
+            delay(3000)
+            if (!busy) break
+            Diag.log("gen", "heartbeat: model=$modelName tokens=$tokenCount ttft=${firstTokenMs}ms ram=${Diag.freeRamMb()}MB pss=${Diag.pssMb()}MB thermal=${Diag.thermalName()} fg=${Diag.foreground}")
+            Diag.updateState("generating", "tokens=$tokenCount model=$modelName")
+            persist()
         }
     }
 
@@ -252,18 +325,36 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         return final.map { it.role }.toTypedArray() to final.map { it.text }.toTypedArray()
     }
 
+    private fun enriched(json: String): JSONObject = try {
+        val o = JSONObject(json)
+        if (firstTokenMs > 0) o.put("ttft_ms", firstTokenMs.toDouble())
+        o.put("pss_mb", Diag.pssMb())
+        o.put("thermal", Diag.thermalName())
+        o.put("fg", Diag.foreground)
+        o
+    } catch (_: Exception) { JSONObject(json) }
+
     private suspend fun runLocalTurn(chatId: String, model: LocalModel) {
         val chat = conversations.find { it.id == chatId } ?: return
         val replyIndex = chat.messages.size - 1
         val (roles, texts) = modelSnapshot(chatId, replyIndex, includeSystem = false)
         val buffer = StringBuilder()
+        Diag.log("gen", "local turn start: promptMsgs=${roles.size} replyIndex=$replyIndex")
         native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
-            override fun onToken(piece: String) { buffer.append(piece); streamAbsolute(chatId, replyIndex, buffer) }
+            override fun onToken(piece: String) {
+                if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
+                buffer.append(piece); tokenCount++
+                streamThrottled(chatId, replyIndex, buffer)
+            }
             override fun onStats(json: String) {
-                val entry = try { perf.record(model.name, JSONObject(json)) } catch (_: Exception) { null }
+                Diag.log("stats", "received: $json")
+                val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                 entry?.let { viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, it.chip()) } }
             }
-        })
+        }, logDir)
+        flushBuffer(chatId, replyIndex, buffer) // guarantee final text shows despite throttling
+        persist()
+        Diag.log("gen", "local turn done: tokens=$tokenCount ttft=${firstTokenMs}ms chars=${buffer.length}")
         withContext(Dispatchers.Main) { status = "Ready" }
     }
 
@@ -275,27 +366,37 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             val (roles, texts) = modelSnapshot(chatId, replyIndex, includeSystem = true)
             val buffer = StringBuilder()
             withContext(Dispatchers.Main) { status = if (step == 0) "Agent: thinking…" else "Agent: step ${step + 1}" }
+            Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size}")
             native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
-                override fun onToken(piece: String) { buffer.append(piece); streamAbsolute(chatId, replyIndex, buffer) }
+                override fun onToken(piece: String) {
+                    if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
+                    buffer.append(piece); tokenCount++
+                    streamThrottled(chatId, replyIndex, buffer)
+                }
                 override fun onStats(json: String) {
-                    val entry = try { perf.record(model.name, JSONObject(json)) } catch (_: Exception) { null }
+                    Diag.log("stats", "step $step received: $json")
+                    val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                     if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, entry.chip()) } }
                 }
-            })
+            }, logDir)
+            flushBuffer(chatId, replyIndex, buffer) // full step text in UI before parse/replace
             val parsed = McpTools.parse(buffer.toString())
             if (parsed.call == null) {
                 if (parsed.attempted) {
+                    Diag.log("agent", "step $step: malformed tool call, retrying with correction prompt")
                     addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT] error: malformed tool call. Use <tool>{\"name\":\"…\",\"arguments\":{…}}</tool> or answer in plain text."))
                     updateChatBlocking(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", "")) }) }
                     replyIndex = (conversations.find { it.id == chatId }?.messages?.size ?: 1) - 1
                     continue
                 }
+                Diag.log("agent", "step $step: final plain answer (${buffer.length} chars)")
                 break // plain final answer: turn complete
             }
             val call = parsed.call
             val summary = call.arguments.let { args ->
                 args.keys().asSequence().take(4).joinToString(", ") { key -> "$key=${args.optString(key).take(48)}" }
             }
+            Diag.log("agent", "step $step: tool call ${call.name}($summary)")
             withContext(Dispatchers.Main) {
                 updateChat(chatId) { conversation ->
                     val messages = conversation.messages.toMutableList()
@@ -306,6 +407,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 status = "Agent: ${call.name}"
             }
             val result = McpTools.execute(call, gh)
+            Diag.log("agent", "step $step: tool ${call.name} result: ${result.take(160).replace('\n', ' ')}")
             addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT name=${call.name}]\n$result"))
             updateChatBlocking(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", "")) }) }
             replyIndex = (conversations.find { it.id == chatId }?.messages?.size ?: 1) - 1
@@ -321,7 +423,10 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         if (i >= 0) conversations[i] = transform(conversations[i])
     }
 
-    fun stop() { native.stop(); status = "Stopping…" }
+    fun stop() {
+        Diag.log("gen", "user requested stop at tokens=$tokenCount (ttft=${firstTokenMs}ms)")
+        native.stop(); status = "Stopping…"
+    }
 
     // ---------- Voice ----------
     fun startRecording() {
@@ -351,7 +456,9 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 withContext(Dispatchers.Main) { status = "Transcribing offline…" }
                 try {
                     val speech = installed.first { it.speech }
-                    val text = native.transcribe(speech.file.absolutePath, samples.toFloatArray())
+                    Diag.log("voice", "transcribe start (${samples.size} samples)")
+                    val text = native.transcribe(speech.file.absolutePath, samples.toFloatArray(), logDir)
+                    Diag.log("voice", "transcribe done: ${text.length} chars")
                     withContext(Dispatchers.Main) { transcript = text.trim(); status = "Review and edit the transcript before sending" }
                 } catch (e: Exception) { withContext(Dispatchers.Main) { status = e.message ?: "Transcription failed" } }
             }
@@ -379,5 +486,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             withContext(Dispatchers.Main) { terminalOutput += "Exit code: $code\n" }
         } catch (e: Exception) { withContext(Dispatchers.Main) { terminalOutput += "Error: ${e.message}\n" } }
     }
-    override fun onCleared() { native.stop(); listening = false; generation?.cancel(); ghJob?.cancel(); recording?.cancel(); super.onCleared() }
+    override fun onCleared() {
+        Diag.log("vm", "onCleared (activity torn down) busy=$busy tokens=$tokenCount")
+        native.stop(); listening = false; generation?.cancel(); ghJob?.cancel(); recording?.cancel(); super.onCleared()
+    }
 }
