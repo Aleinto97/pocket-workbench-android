@@ -1,0 +1,50 @@
+image: eclipse-temurin:17-jdk-jammy
+
+stages:
+  - build
+
+variables:
+  ANDROID_HOME: "$CI_PROJECT_DIR/android-sdk"
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle-home"
+
+build-apk:
+  stage: build
+  timeout: 90m
+  cache:
+    key: gradle-cache-v1
+    paths:
+      - .gradle-home/caches
+      - .gradle-home/wrapper
+  script:
+    - apt-get update -qq && apt-get install -y -qq curl unzip git >/dev/null
+    # --- Android SDK cmdline-tools ---
+    - mkdir -p "$ANDROID_HOME/cmdline-tools"
+    - curl -sSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+    - unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+    - mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+    - yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+    - "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1" >/dev/null
+    # --- Gradle 8.11.1 ---
+    - curl -sSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
+    - unzip -q /tmp/gradle.zip -d /opt
+    - export PATH="/opt/gradle-8.11.1/bin:$PATH"
+    - gradle --version | head -5
+    # --- Native deps (llama.cpp / whisper.cpp) ---
+    - bash scripts/fetch-native.sh
+    # --- Build APK debug ---
+    - gradle :app:assembleDebug --no-daemon --stacktrace
+    - APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+    - cp "$APK" PocketWorkbench-debug.apk
+    - ls -la PocketWorkbench-debug.apk
+    # --- Pubblica APK nel registry dei pacchetti (URL di download stabile) ---
+    - |
+      VERSION="0.2-${CI_COMMIT_SHORT_SHA}"
+      curl --request PUT --silent --show-error --fail \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --upload-file "PocketWorkbench-debug.apk" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/pocket-workbench/${VERSION}/PocketWorkbench-debug-${VERSION}.apk"
+    - echo "Package pubblicato: pocket-workbench ${VERSION}"
+  artifacts:
+    paths:
+      - PocketWorkbench-debug.apk
+    expire_in: 30 days
