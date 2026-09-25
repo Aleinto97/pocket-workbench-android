@@ -164,6 +164,9 @@ object Diag {
 
     fun recent(n: Int): List<String> = synchronized(ring) { ring.toList().takeLast(n) }
 
+    /** Foreground bookkeeping — set from WorkbenchApp lifecycle callbacks. */
+    fun setForeground(v: Boolean) { foreground = v }
+
     /** Last known phase bookkeeping, consumed on the next launch to diagnose process death. */
     fun updateState(phase: String, detail: String = "") {
         if (!this::logsDir.isInitialized) return
@@ -210,7 +213,7 @@ object Diag {
         DeviceInfo.capture(appContext!!).freeRamMb
     } catch (_: Exception) { 0L }
 
-    fun pssMb(): Int = try { Debug.getPss() } catch (_: Exception) { 0 }
+    fun pssMb(): Int = try { Debug.getPss().toInt() } catch (_: Exception) { 0 }
 
     fun thermalName(): String = try {
         val pm = appContext!!.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -276,11 +279,11 @@ class WorkbenchApp : Application() {
             override fun onActivityCreated(a: Activity, b: Bundle?) { Diag.log("lifecycle", "onCreate ${name(a)}") }
             override fun onActivityStarted(a: Activity) { Diag.log("lifecycle", "onStart ${name(a)}") }
             override fun onActivityResumed(a: Activity) {
-                Diag.foreground = true
+                Diag.setForeground(true)
                 Diag.log("lifecycle", "onResume ${name(a)} (app comes to foreground)")
             }
             override fun onActivityPaused(a: Activity) {
-                Diag.foreground = false
+                Diag.setForeground(false)
                 Diag.log("lifecycle", "onPause ${name(a)} (app leaves foreground)")
             }
             override fun onActivityStopped(a: Activity) { Diag.log("lifecycle", "onStop ${name(a)}") }
