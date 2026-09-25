@@ -36,6 +36,10 @@ build-apk:
     - APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
     - cp "$APK" PocketWorkbench-debug.apk
     - ls -la PocketWorkbench-debug.apk
+    # --- Unstripped native libs: needed to symbolicate native crash reports
+    # (bridge.cpp writes pc=<lib>+0xoffset; llvm-symbolizer needs these exact .so)
+    - SYMDIR=$(ls -d app/build/intermediates/cxx/Debug/*/obj/arm64-v8a 2>/dev/null | head -1)
+    - if [ -n "$SYMDIR" ]; then mkdir -p native-symbols && cp "$SYMDIR"/*.so native-symbols/ && tar czf native-symbols.tgz -C native-symbols . && ls -la native-symbols; else echo "WARN: unstripped native libs not found"; fi
     # --- Pubblica APK nel registry dei pacchetti (URL di download stabile) ---
     - |
       VERSION="0.2-${CI_COMMIT_SHORT_SHA}"
@@ -47,4 +51,5 @@ build-apk:
   artifacts:
     paths:
       - PocketWorkbench-debug.apk
-    expire_in: 30 days
+      - native-symbols.tgz
+    expire_in: 90 days

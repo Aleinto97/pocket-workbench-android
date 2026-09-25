@@ -200,7 +200,7 @@ object Diag {
             cause.stackTrace.take(20).forEach { sb.appendLine("  at $it") }
         }
         sb.appendLine()
-        sb.appendLine("Memory: pss=${Debug.getPss()} MB · freeRam=${freeRamMb()} MB · thermal=${thermalName()}")
+        sb.appendLine("Memory: pss=${pssMb()} MB · freeRam=${freeRamMb()} MB · thermal=${thermalName()}")
         sb.appendLine("Foreground: $foreground")
         sb.appendLine("Last 30 events:")
         synchronized(ring) { ring.toList().takeLast(30) }.forEach { sb.appendLine("  $it") }
@@ -213,7 +213,9 @@ object Diag {
         DeviceInfo.capture(appContext!!).freeRamMb
     } catch (_: Exception) { 0L }
 
-    fun pssMb(): Int = try { Debug.getPss().toInt() } catch (_: Exception) { 0 }
+    // Debug.getPss() returns KiB — convert to MB so exports read sensibly
+    // (before this fix the diagnostics export showed "pss=176583 MB").
+    fun pssMb(): Long = try { Debug.getPss() / 1024L } catch (_: Exception) { 0L }
 
     fun thermalName(): String = try {
         val pm = appContext!!.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -242,6 +244,13 @@ object Diag {
         sb.appendLine()
         sb.appendLine("--- recent events (${recent(MAX_RING).size} lines kept) ---")
         recent(MAX_RING).forEach { sb.appendLine(it) }
+        sb.appendLine()
+        sb.appendLine("--- on-disk log tail (covers previous sessions, incl. the dead process) ---")
+        try {
+            val old = File(logsDir, "diag.old.log")
+            if (old.exists()) old.readLines().takeLast(50).forEach { sb.appendLine(it) }
+            if (this::logFile.isInitialized) logFile.readLines().takeLast(120).forEach { sb.appendLine(it) }
+        } catch (_: Exception) {}
         sb.appendLine()
         sb.appendLine("--- old rotation (if present) ---")
         try {

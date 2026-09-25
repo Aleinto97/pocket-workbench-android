@@ -51,6 +51,15 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     var agentMode by androidx.compose.runtime.mutableStateOf(config.getBoolean("agent_mode", false)); private set
     var toolStatus by androidx.compose.runtime.mutableStateOf(""); private set
 
+    // llama.cpp #28878 (SIGSEGV in CPU path with 6+ threads on Android/aarch64):
+    // default 4 compute threads, user-tunable in Models > Compute threads.
+    var genThreads by androidx.compose.runtime.mutableStateOf(config.getInt("gen_threads", 4)); private set
+    fun setGenThreads(n: Int) {
+        genThreads = n.coerceIn(1, 8)
+        config.edit().putInt("gen_threads", genThreads).apply()
+        Diag.log("config", "gen_threads=$genThreads")
+    }
+
     private var generation: Job? = null
     private var ghJob: Job? = null
     private var recording: Job? = null
@@ -339,7 +348,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         val replyIndex = chat.messages.size - 1
         val (roles, texts) = modelSnapshot(chatId, replyIndex, includeSystem = false)
         val buffer = StringBuilder()
-        Diag.log("gen", "local turn start: promptMsgs=${roles.size} replyIndex=$replyIndex")
+        Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads replyIndex=$replyIndex")
         native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
             override fun onToken(piece: String) {
                 if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
@@ -351,7 +360,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                 entry?.let { viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, it.chip()) } }
             }
-        }, logDir)
+        }, logDir, genThreads)
         flushBuffer(chatId, replyIndex, buffer) // guarantee final text shows despite throttling
         persist()
         Diag.log("gen", "local turn done: tokens=$tokenCount ttft=${firstTokenMs}ms chars=${buffer.length}")
@@ -378,7 +387,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                     val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                     if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, entry.chip()) } }
                 }
-            }, logDir)
+            }, logDir, genThreads)
             flushBuffer(chatId, replyIndex, buffer) // full step text in UI before parse/replace
             val parsed = McpTools.parse(buffer.toString())
             if (parsed.call == null) {

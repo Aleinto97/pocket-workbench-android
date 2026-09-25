@@ -232,6 +232,18 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             OutlinedButton(onClick = onImport) { Icon(Icons.Default.FolderOpen, null); Spacer(Modifier.width(6.dp)); Text("Import GGUF") }
             OutlinedButton(onClick = vm::installSpeechModel) { Icon(Icons.Default.Mic, null); Spacer(Modifier.width(6.dp)); Text("Download offline speech model") }
         }
+        Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(12.dp)) {
+                Text("Compute threads: ${vm.genThreads}", style = MaterialTheme.typography.bodyMedium)
+                Text("4 is recommended on 8-core phones. Known llama.cpp bug (#28878): 6+ threads can crash during generation on Android. If the app closes itself mid-answer, set 2 or 1.",
+                    style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
+                    listOf(1, 2, 3, 4, 6, 8).forEach { n ->
+                        FilterChip(selected = vm.genThreads == n, onClick = { vm.setGenThreads(n) }, label = { Text("$n") })
+                    }
+                }
+            }
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item { Text("DOWNLOADED", style = MaterialTheme.typography.labelMedium, color = Indigo) }
             items(vm.installed, key = { it.file.absolutePath }) { model ->

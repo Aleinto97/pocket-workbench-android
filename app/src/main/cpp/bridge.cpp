@@ -9,6 +9,7 @@
 #include <cstring>
 #include <csignal>
 #include <ctime>
+#include <ucontext.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include "llama.h"
@@ -33,6 +34,58 @@ static char g_crash_file[512] = {0};
 static char g_state_file[512] = {0};
 static char g_model_hint[128] = {0};
 
+// Fine-grained journal of the last native call inside the pipeline, so a
+// SIGSEGV report says WHICH call was running (sample vs decode vs callback...).
+static const char * kOpNames[] = {
+    "none", "prefill_decode", "sample", "accept", "to_piece",
+    "token_callback", "gen_decode", "state_save"
+};
+static const int kOpCount = (int) (sizeof(kOpNames) / sizeof(kOpNames[0]));
+static std::atomic<int> g_last_op{0};
+static std::atomic<int> g_threads{0};
+static std::atomic<int> g_nctx{0};
+static std::atomic<int> g_prompt_tokens{0};
+static char g_backend_hint[24] = {0};
+
+// Async-signal-safe-ish maps lookup: print "<lib path>+<offset>" for the
+// library containing addr. This makes the crash report symbolicable offline
+// against the exact unstripped .so kept as a CI artifact.
+static void write_lib_for_addr(int fd, uintptr_t addr) {
+    static char maps_buf[32768];
+    int fdm = open("/proc/self/maps", O_RDONLY);
+    if (fdm < 0) { write_str(fd, "?"); return; }
+    size_t nread = 0;
+    while (nread < sizeof(maps_buf) - 1) {
+        ssize_t k = read(fdm, maps_buf + nread, sizeof(maps_buf) - 1 - nread);
+        if (k <= 0) break;
+        nread += (size_t) k;
+    }
+    close(fdm);
+    maps_buf[nread] = 0;
+    char * p = maps_buf;
+    while (p && *p) {
+        char * eol = strchr(p, '\n');
+        char * dash = strchr(p, '-');
+        if (dash && dash < (eol ? eol : p + nread)) {
+            uintptr_t lo = (uintptr_t) strtoul(p, nullptr, 16);
+            uintptr_t hi = (uintptr_t) strtoul(dash + 1, nullptr, 16);
+            if (addr >= lo && addr < hi) {
+                char * slash = nullptr;
+                for (char * q = p; q < (eol ? eol : maps_buf + nread); ++q) if (*q == '/') slash = q;
+                if (slash) {
+                    size_t len = (size_t) ((eol ? eol : maps_buf + nread) - slash);
+                    write_all(fd, slash, len);
+                    write_str(fd, "+0x");
+                    write_long(fd, (long) (addr - lo));
+                } else { write_str(fd, "anon"); }
+                return;
+            }
+        }
+        p = eol ? eol + 1 : nullptr;
+    }
+    write_str(fd, "?");
+}
+
 // Async-signal-safe helpers: only open/write/close and manual int formatting.
 static void write_all(int fd, const char * s, size_t n) {
     while (n > 0) { ssize_t k = write(fd, s, n); if (k <= 0) return; s += k; n -= (size_t) k; }
@@ -47,15 +100,29 @@ static void write_long(int fd, long v) {
     write_all(fd, b + i, sizeof(b) - (size_t) i);
 }
 
-static void native_crash_handler(int sig, siginfo_t * info, void *) {
+static void native_crash_handler(int sig, siginfo_t * info, void * uctx) {
     if (g_crash_file[0]) {
         int fd = open(g_crash_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             int p = g_phase.load();
+            int op = g_last_op.load();
             write_str(fd, "signal="); write_long(fd, sig);
             write_str(fd, "\nphase="); write_str(fd, kPhaseNames[p >= 0 && p < kPhaseCount ? p : 0]);
+            write_str(fd, "\nlast_op="); write_str(fd, kOpNames[op >= 0 && op < kOpCount ? op : 0]);
             write_str(fd, "\ngen_tokens="); write_long(fd, g_gen_tokens.load());
+            write_str(fd, "\nprompt_tokens="); write_long(fd, g_prompt_tokens.load());
+            write_str(fd, "\nbackend="); write_str(fd, g_backend_hint);
+            write_str(fd, "\nthreads="); write_long(fd, g_threads.load());
+            write_str(fd, "\nctx="); write_long(fd, g_nctx.load());
             write_str(fd, "\nfault_addr=0x"); write_long(fd, (long) (info ? info->si_addr : nullptr));
+#ifdef __aarch64__
+            ucontext_t * uc = (ucontext_t *) uctx;
+            if (uc) {
+                write_str(fd, "\npc="); write_lib_for_addr(fd, (uintptr_t) uc->uc_mcontext.pc);
+                write_str(fd, "\nlr="); write_lib_for_addr(fd, (uintptr_t) uc->uc_mcontext.regs[30]);
+                write_str(fd, "\nsp=0x"); write_long(fd, (long) uc->uc_mcontext.sp);
+            }
+#endif
             write_str(fd, "\nmodel="); write_str(fd, g_model_hint);
             write_str(fd, "\n");
             close(fd);
@@ -83,9 +150,10 @@ static void save_phase_state() {
     FILE * f = fopen(g_state_file, "w");
     if (!f) return;
     int p = g_phase.load();
-    fprintf(f, "pid=%d\nphase=%s\ndetail=tokens=%ld model=%s\nts=%lld\n",
+    fprintf(f, "pid=%d\nphase=%s\ndetail=tokens=%ld model=%s\nts=%lld\nbackend=%s\nthreads=%d\n",
             (int) getpid(), kPhaseNames[p >= 0 && p < kPhaseCount ? p : 0],
-            g_gen_tokens.load(), g_model_hint, (long long) time(nullptr) * 1000LL);
+            g_gen_tokens.load(), g_model_hint, (long long) time(nullptr) * 1000LL,
+            g_backend_hint, g_threads.load());
     fclose(f);
 }
 static void set_phase(int p) { g_phase.store(p); save_phase_state(); }
@@ -118,7 +186,7 @@ Java_com_pocketworkbench_app_NativeEngine_stop(JNIEnv *, jobject) { stop_request
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketworkbench_app_NativeEngine_generate(
-        JNIEnv * env, jobject, jstring path, jobjectArray roles, jobjectArray contents, jobject callback, jstring log_dir) {
+        JNIEnv * env, jobject, jstring path, jobjectArray roles, jobjectArray contents, jobject callback, jstring log_dir, jint threads_j) {
     stop_requested = false;
     g_gen_tokens.store(0);
     std::string model_path = from_java(env, path);
@@ -159,7 +227,14 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 4096;
     cp.n_batch = 512;
-    cp.n_threads = std::clamp((int) std::thread::hardware_concurrency() - 1, 1, 8);
+    // llama.cpp issue #28878: SIGSEGV in the CPU compute path on Android/aarch64
+    // with 6+ threads (thread-count-dependent race, not content-dependent).
+    // hardware_concurrency-1 = 7 on 8-core devices sits in the reliably-crashing
+    // zone; the JVM side defaults to 4 and exposes a user setting (1..8).
+    cp.n_threads = std::clamp(threads_j > 0 ? (int) threads_j : 4, 1, 8);
+    cp.n_threads_batch = cp.n_threads; // keep prefill on the same (safe) count
+    g_threads.store(cp.n_threads);
+    g_nctx.store((int) cp.n_ctx);
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx && gpu_layers > 0) {
         // Context allocation failed with the GPU build; fall back to CPU.
@@ -180,6 +255,8 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     bool ok = on_token != nullptr;
     std::string backend = gpu_layers > 0 ? "Vulkan GPU" : "CPU";
     if (gpu_fallback) backend = "CPU (GPU load failed, fallback)";
+    snprintf(g_backend_hint, sizeof(g_backend_hint), "%s",
+             gpu_layers > 0 ? "vulkan" : (gpu_fallback ? "cpu-fb" : "cpu"));
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     std::vector<std::string> r, c;
@@ -216,11 +293,13 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(0xC0FFEE));
 
     set_phase(5); // prefill
+    g_prompt_tokens.store(n);
     std::string stop_reason = "max_tokens";
     auto prefill_start = std::chrono::steady_clock::now();
     for (int offset = 0; ok && offset < n && !stop_requested; offset += 512) {
         int count = std::min(512, n - offset);
         llama_batch batch = llama_batch_get_one(tokens.data() + offset, count);
+        g_last_op.store(1); // prefill_decode
         if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
     }
     double prefill_ms = ms_since(prefill_start);
@@ -228,23 +307,28 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     auto gen_start = std::chrono::steady_clock::now();
     set_phase(6); // generating
     for (int i = 0; ok && i < 512 && !stop_requested; ++i) {
+        g_last_op.store(2); // sample
         llama_token token = llama_sampler_sample(sampler, ctx, -1);
         if (llama_vocab_is_eog(vocab, token)) { stop_reason = "eog"; break; }
+        g_last_op.store(3); // accept
         llama_sampler_accept(sampler, token);
+        g_last_op.store(4); // to_piece
         std::vector<char> piece(256);
         int len = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true);
         if (len < 0) { piece.resize(-len); len = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true); }
         if (len > 0) {
             std::string str(piece.data(), len);
+            g_last_op.store(5); // token_callback
             jstring js = env->NewStringUTF(str.c_str());
             if (js) { env->CallVoidMethod(callback, on_token, js); env->DeleteLocalRef(js); }
             if (env->ExceptionCheck()) { stop_reason = "error"; break; }
         }
         llama_batch batch = llama_batch_get_one(&token, 1);
+        g_last_op.store(6); // gen_decode
         if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
         ++gen_tokens;
         g_gen_tokens.store(gen_tokens);
-        if ((gen_tokens & 127) == 0) save_phase_state(); // refresh native_state.txt every 128 tokens
+        if ((gen_tokens & 127) == 0) { g_last_op.store(7); save_phase_state(); } // refresh native_state.txt every 128 tokens
     }
     if (stop_requested) stop_reason = "user_stop";
     double gen_ms = ms_since(gen_start);
@@ -277,6 +361,7 @@ Java_com_pocketworkbench_app_NativeEngine_transcribe(JNIEnv * env, jobject, jstr
             snprintf(g_crash_file, sizeof(g_crash_file), "%s/native_crash.txt", logs.c_str());
             snprintf(g_state_file, sizeof(g_state_file), "%s/native_state.txt", logs.c_str());
             snprintf(g_model_hint, sizeof(g_model_hint), "speech");
+            snprintf(g_backend_hint, sizeof(g_backend_hint), "whisper");
             static bool installed = false;
             if (!installed) { install_native_crash_handlers(); installed = true; }
         }
