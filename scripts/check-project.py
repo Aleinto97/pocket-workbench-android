@@ -18,8 +18,14 @@ ui = (src / 'MainActivity.kt').read_text()
 for label in ('Stop generation', 'Model library', 'Conversations', 'Workspace', 'Message or edit voice transcript'):
     assert label in ui
 model = (src / 'Data.kt').read_text()
-assert 'Content-Range' in model and 'outputStream(append)' in model
+assert 'Content-Range' in model and 'FileOutputStream(partial, append)' in model
 assert 'saveHistory' in model and 'GGUF' in model
 vm = (src / 'WorkbenchViewModel.kt').read_text()
 assert 'native.stop()' in vm and 'native.transcribe' in vm
+for new_file in ('PerfLog.kt', 'GitHubClient.kt', 'McpTools.kt'):
+    assert (src / new_file).exists(), new_file
+assert 'onStats' in native and 'onStats' in bridge, 'stats callback must exist on both sides'
+assert 'device/code' in (src / 'GitHubClient.kt').read_text(), 'device flow endpoint missing'
+assert 'systemPrompt' in (src / 'McpTools.kt').read_text() and 'dispatch_workflow' in (src / 'McpTools.kt').read_text()
+assert 'McpTools.parse' in vm and 'McpTools.execute' in vm and 'perf.record' in vm
 print('Static project smoke checks passed; Android build/device tests not run.')

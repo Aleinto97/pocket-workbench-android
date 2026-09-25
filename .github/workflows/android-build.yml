@@ -29,3 +29,25 @@ jobs:
           name: PocketWorkbench-debug
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: PocketWorkbench-debug
+      - name: Create release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v0.2.${{ github.run_number }}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "Pocket Workbench $TAG (debug)" \
+            --notes "Automated debug APK from commit ${{ github.sha }}. Engineering preview: not device-validated." || \
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.apk
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.apk

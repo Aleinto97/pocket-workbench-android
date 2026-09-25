@@ -1,13 +1,15 @@
 package com.pocketworkbench.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -15,26 +17,41 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
 
@@ -42,6 +59,8 @@ private val Indigo = Color(0xFF94B5FF)
 private val Dark = Color(0xFF101624)
 private val Panel = Color(0xFF1B2535)
 private val Pale = Color(0xFFDDE7FF)
+private val Console = Color(0xFF0A0F17)
+private val DividerColor = Color(0xFF344356)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,7 +79,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Page { Chat, Models, Workspace }
+private enum class Page { Chat, Models, Stats, Workspace, GitHub }
+
 @Composable private fun Workbench(vm: WorkbenchViewModel, onMic: () -> Unit, onImport: () -> Unit) {
     var page by remember { mutableStateOf(Page.Chat) }
     val wide = LocalConfiguration.current.screenWidthDp >= 840
@@ -71,24 +91,28 @@ private enum class Page { Chat, Models, Workspace }
                 Spacer(Modifier.weight(1f))
                 Text(if (vm.busy) "● Running on device" else "● Local & private", style = MaterialTheme.typography.labelMedium)
             }
-            HorizontalDivider(color = Color(0xFF344356))
+            HorizontalDivider(color = DividerColor)
             Row(Modifier.weight(1f)) {
                 NavigationRail(containerColor = Dark) {
-                    Spacer(Modifier.height(20.dp))
+                    Spacer(Modifier.height(12.dp))
                     NavigationRailItem(selected = page == Page.Chat, onClick = { page = Page.Chat }, icon = { Icon(Icons.Default.ChatBubbleOutline, "Chat") }, label = { Text("Chat") })
                     NavigationRailItem(selected = page == Page.Models, onClick = { page = Page.Models }, icon = { Icon(Icons.Default.Download, "Models") }, label = { Text("Models") })
+                    NavigationRailItem(selected = page == Page.Stats, onClick = { page = Page.Stats }, icon = { Icon(Icons.Default.Speed, "Stats") }, label = { Text("Stats") })
                     NavigationRailItem(selected = page == Page.Workspace, onClick = { page = Page.Workspace }, icon = { Icon(Icons.Default.Terminal, "Workspace") }, label = { Text("Files") })
+                    NavigationRailItem(selected = page == Page.GitHub, onClick = { page = Page.GitHub }, icon = { Icon(Icons.Default.Code, "GitHub") }, label = { Text("GitHub") })
                 }
                 if (page == Page.Chat && wide) ConversationSidebar(vm, Modifier.width(250.dp).fillMaxHeight())
                 Box(Modifier.weight(1f).fillMaxHeight()) {
                     when (page) {
                         Page.Chat -> ChatPage(vm, onMic, !wide)
                         Page.Models -> ModelsPage(vm, onImport)
+                        Page.Stats -> StatsPage(vm)
                         Page.Workspace -> WorkspacePage(vm)
+                        Page.GitHub -> GitHubPage(vm)
                     }
                 }
             }
-            HorizontalDivider(color = Color(0xFF344356))
+            HorizontalDivider(color = DividerColor)
             Text(vm.status, modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, maxLines = 2)
         }
     }
@@ -116,6 +140,8 @@ private enum class Page { Chat, Models, Workspace }
 @Composable private fun ChatPage(vm: WorkbenchViewModel, onMic: () -> Unit, compact: Boolean) {
     var draft by remember { mutableStateOf("") }
     var showChats by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
     LaunchedEffect(vm.transcript) { if (vm.transcript.isNotBlank()) { draft = vm.transcript; vm.clearTranscript() } }
     val chat = vm.active
     val scroll = rememberLazyListState()
@@ -131,6 +157,9 @@ private enum class Page { Chat, Models, Workspace }
                 }, confirmButton = { TextButton(onClick = { vm.newChat(); showChats = false }) { Text("New chat") } })
             }
             Text(chat?.title ?: "Chat", style = MaterialTheme.typography.titleLarge, maxLines = 1, modifier = Modifier.weight(1f))
+            if (vm.ghLoggedIn) FilterChip(selected = vm.agentMode, onClick = { vm.toggleAgentMode() },
+                label = { Text("Agent") }, leadingIcon = { Icon(Icons.Default.SmartToy, null, Modifier.size(18.dp)) })
+            Spacer(Modifier.width(8.dp))
             var expanded by remember { mutableStateOf(false) }
             Box {
                 OutlinedButton(onClick = { expanded = true }) { Text(vm.selectedModel?.name?.take(24) ?: "Choose model") }
@@ -139,6 +168,10 @@ private enum class Page { Chat, Models, Workspace }
                     if (vm.installed.none { !it.speech }) DropdownMenuItem(text = { Text("Download a GGUF in Models") }, onClick = { expanded = false })
                 }
             }
+            IconButton(onClick = {
+                clipboard.setText(AnnotatedString(vm.exportPerfLog()))
+                Toast.makeText(context, "Performance log copied", Toast.LENGTH_SHORT).show()
+            }, modifier = Modifier.semantics { contentDescription = "Copy performance log" }) { Icon(Icons.Default.ContentCopy, "Copy performance log") }
         }
         HorizontalDivider()
         if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -149,12 +182,24 @@ private enum class Page { Chat, Models, Workspace }
         } else LazyColumn(state = scroll, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             items(messages.size) { i ->
                 val message = messages[i]
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
-                    Surface(color = if (message.role == "user") Color(0xFF304C7C) else Panel, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 760.dp)) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(if (message.role == "user") "YOU" else "ASSISTANT", style = MaterialTheme.typography.labelSmall, color = Indigo)
-                            Spacer(Modifier.height(6.dp))
-                            Text(message.text.ifEmpty { "Thinking…" }, style = MaterialTheme.typography.bodyLarge)
+                when (message.role) {
+                    "tool_result" -> Surface(color = Console, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
+                        Text(message.text, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Color(0xFF9FB2CC), modifier = Modifier.padding(12.dp))
+                    }
+                    else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
+                        Surface(color = if (message.role == "user") Color(0xFF304C7C) else Panel, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 760.dp)) {
+                            Column(Modifier.padding(16.dp)) {
+                                Text(if (message.role == "user") "YOU" else "ASSISTANT", style = MaterialTheme.typography.labelSmall, color = Indigo)
+                                Spacer(Modifier.height(6.dp))
+                                Text(message.text.ifEmpty { "Thinking…" }, style = MaterialTheme.typography.bodyLarge)
+                                if (message.perf.isNotBlank() && message.role == "assistant") {
+                                    Spacer(Modifier.height(8.dp))
+                                    AssistChip(onClick = {
+                                        clipboard.setText(AnnotatedString("${message.perf}\n${vm.deviceSummary()}"))
+                                        Toast.makeText(context, "Run metrics copied", Toast.LENGTH_SHORT).show()
+                                    }, label = { Text(message.perf, style = MaterialTheme.typography.labelSmall) })
+                                }
+                            }
                         }
                     }
                 }
@@ -222,6 +267,86 @@ private enum class Page { Chat, Models, Workspace }
         }
     }
 }
+@Composable private fun StatsPage(vm: WorkbenchViewModel) {
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    val entries = vm.perfEntries
+    val problems = entries.filter { it.problem.isNotBlank() }
+    val cpuRuns = entries.filter { it.backend.startsWith("CPU") }
+    val gpuRuns = entries.filter { it.backend.startsWith("Vulkan") }
+    fun avgTps(list: List<PerfEntry>): Double = if (list.isEmpty()) 0.0 else list.map { it.genTps }.average()
+    var confirmClear by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().padding(24.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Performance & technical logs", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.weight(1f))
+            IconButton(onClick = { clipboard.setText(AnnotatedString(vm.exportPerfLog())); Toast.makeText(context, "Performance log copied", Toast.LENGTH_SHORT).show() }) { Icon(Icons.Default.ContentCopy, "Copy full log") }
+            IconButton(onClick = {
+                val intent = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, vm.exportPerfLog()) }
+                context.startActivity(Intent.createChooser(intent, "Share performance log"))
+            }) { Icon(Icons.Default.Share, "Share log") }
+            IconButton(onClick = { confirmClear = true }) { Icon(Icons.Default.DeleteSweep, "Clear log") }
+        }
+        if (confirmClear) AlertDialog(onDismissRequest = { confirmClear = false },
+            title = { Text("Clear performance log?") }, text = { Text("All recorded runs will be removed from this device.") },
+            confirmButton = { TextButton(onClick = { vm.clearPerfLog(); confirmClear = false }) { Text("Clear") } },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } })
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 8.dp)) {
+            item {
+                Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("DEVICE", style = MaterialTheme.typography.labelMedium, color = Indigo)
+                        Spacer(Modifier.height(6.dp))
+                        Text(vm.deviceSummary(), style = MaterialTheme.typography.bodyMedium)
+                        Text("Engine: llama.cpp · NPU not used by this build (CPU + Vulkan GPU only)", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    }
+                }
+            }
+            item {
+                Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("WHERE IT RUNS", style = MaterialTheme.typography.labelMedium, color = Indigo)
+                        Spacer(Modifier.height(6.dp))
+                        Text("CPU: ${cpuRuns.size} runs · avg ${String.format(java.util.Locale.US, "%.1f", avgTps(cpuRuns))} tok/s", style = MaterialTheme.typography.bodyMedium)
+                        Text("Vulkan GPU: ${gpuRuns.size} runs · avg ${String.format(java.util.Locale.US, "%.1f", avgTps(gpuRuns))} tok/s", style = MaterialTheme.typography.bodyMedium)
+                        if (cpuRuns.isNotEmpty() && gpuRuns.isEmpty()) Text("All runs so far used the CPU backend.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    }
+                }
+            }
+            if (problems.isNotEmpty()) item {
+                Surface(color = Color(0xFF3A2430), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Warning, null, tint = Color(0xFFFFB4A0), modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("DETECTED PROBLEMS", style = MaterialTheme.typography.labelMedium, color = Color(0xFFFFB4A0)) }
+                        Spacer(Modifier.height(6.dp))
+                        problems.take(8).forEach { entry ->
+                            Text("${java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(entry.timestamp))} · ${entry.model.take(24)}: ${entry.problem}", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+            item { Text("RUN HISTORY (newest first)", style = MaterialTheme.typography.labelMedium, color = Indigo, modifier = Modifier.padding(top = 4.dp)) }
+            if (entries.isEmpty()) item {
+                Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Text("No runs recorded yet. Send a message in Chat and the technical metrics will appear here.", color = Color.LightGray, modifier = Modifier.padding(16.dp))
+                }
+            }
+            items(entries.size) { i ->
+                val entry = entries[i]
+                Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(entry.model.take(30), style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(entry.timestamp)), style = MaterialTheme.typography.labelSmall, color = Color.LightGray)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(String.format(java.util.Locale.US, "%s · %d threads · gen %.1f tok/s (%d tok in %.1fs) · prefill %.0f tok/s", entry.backend, entry.threads, entry.genTps, entry.genTokens, entry.genMs / 1000.0, entry.prefillTps), style = MaterialTheme.typography.bodySmall)
+                        Text(String.format(java.util.Locale.US, "Load: %s · RAM free %d MB · stop: %s", if (entry.cached) "model cached" else String.format("%.1fs", entry.loadMs / 1000.0), entry.freeRamMb, entry.stop), style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                        if (entry.problem.isNotBlank()) Text("⚠ ${entry.problem}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB4A0))
+                    }
+                }
+            }
+        }
+    }
+}
 @Composable private fun WorkspacePage(vm: WorkbenchViewModel) {
     var command by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().padding(24.dp)) {
@@ -229,7 +354,7 @@ private enum class Page { Chat, Models, Workspace }
         Text("App-private Android shell · ${vm.workspace.absolutePath}", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         Text("The assistant does not execute commands automatically. This is not a Linux container.", style = MaterialTheme.typography.bodySmall, color = Indigo)
         Spacer(Modifier.height(16.dp))
-        Surface(color = Color(0xFF0A0F17), shape = RoundedCornerShape(12.dp), modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Surface(color = Console, shape = RoundedCornerShape(12.dp), modifier = Modifier.weight(1f).fillMaxWidth()) {
             val state = rememberLazyListState()
             LaunchedEffect(vm.terminalOutput.length) { state.scrollToItem(0) }
             LazyColumn(state = state, modifier = Modifier.padding(16.dp)) { item { Text(vm.terminalOutput, style = MaterialTheme.typography.bodyMedium) } }
@@ -238,6 +363,88 @@ private enum class Page { Chat, Models, Workspace }
             OutlinedTextField(command, { command = it }, label = { Text("Shell command") }, modifier = Modifier.weight(1f), singleLine = true)
             Spacer(Modifier.width(8.dp))
             Button(onClick = { vm.runShell(command); command = "" }, enabled = command.isNotBlank()) { Text("Run") }
+        }
+    }
+}
+@Composable private fun GitHubPage(vm: WorkbenchViewModel) {
+    val context = LocalContext.current
+    Column(Modifier.fillMaxSize().padding(24.dp)) {
+        Text("GitHub", style = MaterialTheme.typography.headlineMedium)
+        Text(vm.ghStatus, style = MaterialTheme.typography.bodyMedium, color = Indigo, modifier = Modifier.padding(vertical = 8.dp))
+        if (vm.ghLoggedIn) {
+            Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.AccountCircle, null, tint = Indigo, modifier = Modifier.size(40.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(vm.ghLogin, style = MaterialTheme.typography.titleMedium)
+                        Text("Scopes: ${vm.ghScopes.ifBlank { "repo, workflow" }}", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Agent tool mode", style = MaterialTheme.typography.titleSmall)
+                        Text("Let the local model call GitHub tools (repos, files, issues, PRs, Actions) inside chat.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    }
+                    Switch(checked = vm.agentMode, onCheckedChange = { vm.toggleAgentMode() })
+                }
+            }
+            if (vm.toolStatus.isNotBlank()) Text(vm.toolStatus, style = MaterialTheme.typography.bodySmall, color = Indigo, modifier = Modifier.padding(top = 8.dp))
+            Spacer(Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.testGh() }) { Text("Test connection") }
+                OutlinedButton(onClick = { vm.signOutGh() }) { Icon(Icons.Default.Logout, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Sign out") }
+            }
+            Spacer(Modifier.height(16.dp))
+            Text("Token is stored encrypted with the Android Keystore and used only for GitHub API calls from this app.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+        } else if (vm.ghPolling && vm.ghUserCode.isNotBlank()) {
+            Surface(color = Panel, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("1. Open github.com/login/device", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(4.dp))
+                    Text("2. Enter this one-time code", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(12.dp))
+                    Surface(color = Console, shape = RoundedCornerShape(12.dp)) {
+                        Text(vm.ghUserCode, fontFamily = FontFamily.Monospace, fontSize = 32.sp, color = Indigo, modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp))
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Button(onClick = {
+                        try { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/login/device"))) }
+                        catch (_: Exception) { Toast.makeText(context, "No browser available; open the URL manually", Toast.LENGTH_SHORT).show() }
+                    }) { Icon(Icons.Default.OpenInNew, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Open github.com/login/device") }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = { vm.cancelGhLogin() }) { Text("Cancel sign-in") }
+                }
+            }
+        } else {
+            Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Sign in with OAuth Device Flow", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(8.dp))
+                    Text("One-time setup: on github.com go to Settings → Developer settings → OAuth Apps → New OAuth App. Any callback URL works; check \"Enable Device Flow\", then paste the Client ID here.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    Spacer(Modifier.height(12.dp))
+                    var clientId by remember(vm.ghClientId) { mutableStateOf(vm.ghClientId) }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(clientId, { clientId = it }, label = { Text("OAuth App Client ID") }, singleLine = true, modifier = Modifier.weight(1f))
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedButton(onClick = { vm.saveGhClientId(clientId) }) { Text("Save") }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { vm.startGhLogin() }, enabled = vm.ghClientId.isNotBlank()) {
+                        Icon(Icons.Default.OpenInNew, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Sign in with GitHub")
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Why sign in?", style = MaterialTheme.typography.titleSmall)
+                    Text("Agent mode in Chat: the on-device model can read your repositories, commit files, open issues and PRs, and trigger or inspect GitHub Actions builds — no token pasting in chat needed.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                }
+            }
         }
     }
 }

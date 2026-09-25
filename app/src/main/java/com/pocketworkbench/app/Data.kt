@@ -14,7 +14,7 @@ import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-data class ChatMessage(val role: String, val text: String)
+data class ChatMessage(val role: String, val text: String, val perf: String = "")
 data class Conversation(val id: String, val title: String, val model: String, val messages: MutableList<ChatMessage>)
 data class LocalModel(val repo: String, val name: String, val file: File, val speech: Boolean = false)
 data class RemoteModel(val repo: String, val filename: String, val bytes: Long, val revision: String, val gated: Boolean = false)
@@ -33,13 +33,17 @@ class PrivateStore(private val context: Context) {
             val item = array.getJSONObject(i)
             val msgs = item.getJSONArray("messages")
             Conversation(item.getString("id"), item.getString("title"), item.optString("model"),
-                (0 until msgs.length()).map { j -> val m = msgs.getJSONObject(j); ChatMessage(m.getString("role"), m.getString("text")) }.toMutableList())
+                (0 until msgs.length()).map { j -> val m = msgs.getJSONObject(j); ChatMessage(m.getString("role"), m.getString("text"), m.optString("perf")) }.toMutableList())
         }
     } catch (_: Exception) { emptyList() }
     @Synchronized fun saveHistory(chats: List<Conversation>) {
         val array = JSONArray()
         chats.forEach { chat ->
-            val msgs = JSONArray(); chat.messages.forEach { msgs.put(JSONObject().put("role", it.role).put("text", it.text)) }
+            val msgs = JSONArray(); chat.messages.forEach { m ->
+                val obj = JSONObject().put("role", m.role).put("text", m.text)
+                if (m.perf.isNotBlank()) obj.put("perf", m.perf)
+                msgs.put(obj)
+            }
             array.put(JSONObject().put("id", chat.id).put("title", chat.title).put("model", chat.model).put("messages", msgs))
         }
         val temp = File(history.parentFile, "history.tmp")

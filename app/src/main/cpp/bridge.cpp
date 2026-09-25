@@ -3,12 +3,23 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <chrono>
 #include <algorithm>
+#include <cstdio>
 #include "llama.h"
 #include "ggml-backend.h"
 #include "whisper.h"
 
 static std::atomic<bool> stop_requested{false};
+
+// The last model stays resident so repeated generations (for example a
+// multi-step agent tool loop) skip the load phase. A fresh context is
+// allocated per call, so no KV state leaks between requests.
+static llama_model * cached_model = nullptr;
+static std::string cached_path;
+static int cached_gpu_layers = 0;
+static double last_load_ms = 0.0;
+
 static std::string from_java(JNIEnv * env, jstring value) {
     if (!value) return {};
     const char * raw = env->GetStringUTFChars(value, nullptr);
@@ -20,6 +31,10 @@ static void fail(JNIEnv * env, const char * reason) {
     jclass type = env->FindClass("java/lang/IllegalStateException");
     env->ThrowNew(type, reason);
 }
+static double ms_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketworkbench_app_NativeEngine_stop(JNIEnv *, jobject) { stop_requested = true; }
 
@@ -29,24 +44,51 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     stop_requested = false;
     std::string model_path = from_java(env, path);
     ggml_backend_load_all();
-    llama_model_params mp = llama_model_default_params();
     const bool gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) || ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
-    mp.n_gpu_layers = gpu ? 99 : 0;
-    llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
-    if (!model && gpu) { mp.n_gpu_layers = 0; model = llama_model_load_from_file(model_path.c_str(), mp); }
-    if (!model) { fail(env, "Cannot load GGUF model. Check format and free memory."); return; }
+    int gpu_layers = gpu ? 99 : 0;
+    bool loaded_now = false;
+    bool gpu_fallback = false;
+    llama_model * model = nullptr;
+    if (cached_model && cached_path == model_path) {
+        model = cached_model;
+        gpu_layers = cached_gpu_layers;
+    } else {
+        if (cached_model) { llama_model_free(cached_model); cached_model = nullptr; cached_path.clear(); }
+        auto load_start = std::chrono::steady_clock::now();
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = gpu ? 99 : 0;
+        model = llama_model_load_from_file(model_path.c_str(), mp);
+        if (!model && gpu) { mp.n_gpu_layers = 0; gpu_layers = 0; gpu_fallback = true; model = llama_model_load_from_file(model_path.c_str(), mp); }
+        if (!model) { fail(env, "Cannot load GGUF model. Check format and free memory."); return; }
+        cached_model = model; cached_path = model_path; cached_gpu_layers = gpu_layers;
+        loaded_now = true;
+        last_load_ms = ms_since(load_start);
+    }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 4096;
     cp.n_batch = 512;
     cp.n_threads = std::clamp((int) std::thread::hardware_concurrency() - 1, 1, 8);
     llama_context * ctx = llama_init_from_model(model, cp);
-    if (!ctx && gpu && mp.n_gpu_layers > 0) {
-        llama_model_free(model);
+    if (!ctx && gpu_layers > 0) {
+        // Context allocation failed with the GPU build; fall back to CPU.
+        if (cached_model) { llama_model_free(cached_model); cached_model = nullptr; cached_path.clear(); }
+        auto load_start = std::chrono::steady_clock::now();
+        llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers = 0;
         model = llama_model_load_from_file(model_path.c_str(), mp);
-        if (model) ctx = llama_init_from_model(model, cp);
+        gpu_layers = 0; gpu_fallback = true; loaded_now = true;
+        last_load_ms = ms_since(load_start);
+        if (model) { cached_model = model; cached_path = model_path; cached_gpu_layers = 0; ctx = llama_init_from_model(model, cp); }
     }
-    if (!ctx) { if (model) llama_model_free(model); fail(env, "Cannot allocate model context."); return; }
+    if (!ctx) { fail(env, "Cannot allocate model context."); return; }
+
+    jclass callback_type = env->GetObjectClass(callback);
+    jmethodID on_token = env->GetMethodID(callback_type, "onToken", "(Ljava/lang/String;)V");
+    jmethodID on_stats = env->GetMethodID(callback_type, "onStats", "(Ljava/lang/String;)V");
+    bool ok = on_token != nullptr;
+    std::string backend = gpu_layers > 0 ? "Vulkan GPU" : "CPU";
+    if (gpu_fallback) backend = "CPU (GPU load failed, fallback)";
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
     std::vector<std::string> r, c;
     std::vector<llama_chat_message> messages;
@@ -61,34 +103,37 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     const char * tmpl = llama_model_chat_template(model, nullptr);
     int required = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
     if (required <= 0 || required > 4 * 1024 * 1024) {
-        llama_free(ctx); llama_model_free(model); fail(env, "Model chat template is unavailable."); return;
+        llama_free(ctx); fail(env, "Model chat template is unavailable."); return;
     }
     std::string prompt(required + 1, '\0');
     llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, prompt.data(), prompt.size());
     prompt.resize(required);
     int n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
-    if (n >= 0) { llama_free(ctx); llama_model_free(model); fail(env, "Tokenization failed."); return; }
+    if (n >= 0) { llama_free(ctx); fail(env, "Tokenization failed."); return; }
     std::vector<llama_token> tokens(-n);
     n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens.data(), tokens.size(), true, true);
     if (n <= 0 || n >= 3500) {
-        llama_free(ctx); llama_model_free(model); fail(env, "Conversation is too long for the 4096-token context."); return;
+        llama_free(ctx); fail(env, "Conversation is too long for the 4096-token context."); return;
     }
     tokens.resize(n);
     llama_sampler_chain_params sp = llama_sampler_chain_default_params();
     llama_sampler * sampler = llama_sampler_chain_init(sp);
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(0xC0FFEE));
-    jclass callback_type = env->GetObjectClass(callback);
-    jmethodID on_token = env->GetMethodID(callback_type, "onToken", "(Ljava/lang/String;)V");
-    bool ok = on_token != nullptr;
+
+    std::string stop_reason = "max_tokens";
+    auto prefill_start = std::chrono::steady_clock::now();
     for (int offset = 0; ok && offset < n && !stop_requested; offset += 512) {
         int count = std::min(512, n - offset);
         llama_batch batch = llama_batch_get_one(tokens.data() + offset, count);
-        if (llama_decode(ctx, batch) != 0) ok = false;
+        if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
     }
+    double prefill_ms = ms_since(prefill_start);
+    int gen_tokens = 0;
+    auto gen_start = std::chrono::steady_clock::now();
     for (int i = 0; ok && i < 512 && !stop_requested; ++i) {
         llama_token token = llama_sampler_sample(sampler, ctx, -1);
-        if (llama_vocab_is_eog(vocab, token)) break;
+        if (llama_vocab_is_eog(vocab, token)) { stop_reason = "eog"; break; }
         llama_sampler_accept(sampler, token);
         std::vector<char> piece(256);
         int len = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true);
@@ -97,14 +142,27 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
             std::string str(piece.data(), len);
             jstring js = env->NewStringUTF(str.c_str());
             if (js) { env->CallVoidMethod(callback, on_token, js); env->DeleteLocalRef(js); }
-            if (env->ExceptionCheck()) break;
+            if (env->ExceptionCheck()) { stop_reason = "error"; break; }
         }
         llama_batch batch = llama_batch_get_one(&token, 1);
-        if (llama_decode(ctx, batch) != 0) ok = false;
+        if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
+        ++gen_tokens;
     }
+    if (stop_requested) stop_reason = "user_stop";
+    double gen_ms = ms_since(gen_start);
     llama_sampler_free(sampler);
+
+    if (on_stats && !env->ExceptionCheck()) {
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+            "{\"backend\":\"%s\",\"threads\":%d,\"ctx\":%d,\"load_ms\":%.1f,\"model_cached\":%d,\"gpu_fallback\":%d,"
+            "\"prefill_tokens\":%d,\"prefill_ms\":%.1f,\"gen_tokens\":%d,\"gen_ms\":%.1f,\"stop\":\"%s\"}",
+            backend.c_str(), cp.n_threads, (int) cp.n_ctx, loaded_now ? last_load_ms : 0.0,
+            loaded_now ? 0 : 1, gpu_fallback ? 1 : 0, n, prefill_ms, gen_tokens, gen_ms, stop_reason.c_str());
+        jstring js = env->NewStringUTF(buf);
+        if (js) { env->CallVoidMethod(callback, on_stats, js); env->DeleteLocalRef(js); }
+    }
     llama_free(ctx);
-    llama_model_free(model);
     if (!ok && !env->ExceptionCheck() && !stop_requested) fail(env, "Inference failed or context is full.");
 }
 
