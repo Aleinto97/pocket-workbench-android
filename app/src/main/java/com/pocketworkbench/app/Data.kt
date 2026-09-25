@@ -99,7 +99,7 @@ class HubClient {
             if (total > 0 && total + 256L * 1024 * 1024 > StatFs(destination.parentFile!!.absolutePath).availableBytes) throw IOException("Insufficient storage: need ${total / 1048576} MiB plus reserve")
             val body = response.body ?: throw IOException("Empty download")
             var done = initial
-            body.byteStream().use { input -> partial.outputStream(append).buffered().use { output ->
+            body.byteStream().use { input -> java.io.FileOutputStream(partial, append).buffered().use { output ->
                 // A 200 response restarts the file instead of appending stale partial bytes.
                 val buffer = ByteArray(256 * 1024)
                 while (true) {
