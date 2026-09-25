@@ -1,0 +1,7 @@
+.gradle/
+.idea/
+**/build/
+local.properties
+native/llama.cpp/
+native/whisper.cpp/
+*.apk
