@@ -1,6 +1,6 @@
 # Pocket Workbench — Android tablet source project
 
-**Status: engineering preview, not a production-ready APK.** This project is an English-language, landscape-friendly Android app designed around HONOR MagicPad 4 (Snapdragon 8 Gen 5). It has not been compiled or run on the tablet in this workspace. The native dependencies are obtained during local setup; no proprietary model or speech weights are bundled.
+**Status: engineering preview, not a production-ready app.** This English-language, landscape-friendly Android app is designed around HONOR MagicPad 4 (Snapdragon 8 Gen 5). A CPU-only ARM64 debug APK was built successfully by GitHub Actions on September 25, 2026 ([run #6](https://github.com/Aleinto97/pocket-workbench-android/actions/runs/36124794064)); it has not been run on the tablet. Native dependencies are fetched during the build; no proprietary model or speech weights are bundled.
 
 ## Implemented
 
@@ -15,7 +15,7 @@
 - **No integrated Linux distribution, Docker-like container, package manager, or autonomous agent tool loop.** The Workspace tab uses `/system/bin/sh`, which runs in the Android app's context. It must not be presented as isolated Linux. A real userland would need a separately packaged and tested PRoot/Alpine integration, compatible executable delivery, and device testing; Android 10+ restricts executing downloaded binaries from writable app storage.
 - **No validated NPU support.** Upstream Hexagon paths are device-specific. CPU is the default; Vulkan build is optional and untested on this tablet. The GPU fallback covers load/context creation, not driver failure mid-generation.
 - Downloads are bound to the app process. Android may terminate them if it kills the process; `.part` files remain for retry. There is no background foreground-service notification, cancellation button, SHA-256 verification against Hub metadata, model quality ranking, or automatic split GGUF handling.
-- Code has not passed an Android Gradle build or device test here. Native upstream branches must be pinned and API compatibility verified before release. A release build should also include profiling, error and memory tests, accessibility checks, background transfer tests, and a privacy/security review.
+- The Android debug build passed CI, but no device test has been performed. Native upstream branches must be pinned and API compatibility verified before release. A release build should also include profiling, error and memory tests, accessibility checks, background transfer tests, and a privacy/security review.
 
 ## Build on a machine with Android Studio
 
@@ -44,4 +44,4 @@ The included `scripts/check-project.py` verifies project structure, manifest per
 
 ## Optional remote build
 
-If this source is placed in a GitHub repository, `.github/workflows/android-build.yml` runs a debug APK build on GitHub Actions and uploads the APK as a workflow artifact. The workflow is provided for reproducibility; it has not been executed here. A successful CI build alone is not tablet validation or a production release.
+`.github/workflows/android-build.yml` builds a debug APK on GitHub Actions and uploads it as a workflow artifact. [Run #6](https://github.com/Aleinto97/pocket-workbench-android/actions/runs/36124794064) passed. A successful CI build alone is not tablet validation or a production release.
