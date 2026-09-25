@@ -6,6 +6,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <ctime>
@@ -46,6 +47,11 @@ static std::atomic<int> g_threads{0};
 static std::atomic<int> g_nctx{0};
 static std::atomic<int> g_prompt_tokens{0};
 static char g_backend_hint[24] = {0};
+
+// forward decls: the maps helper below is defined before these helpers
+static void write_all(int fd, const char * s, size_t n);
+static void write_str(int fd, const char * s);
+static void write_long(int fd, long v);
 
 // Async-signal-safe-ish maps lookup: print "<lib path>+<offset>" for the
 // library containing addr. This makes the crash report symbolicable offline
