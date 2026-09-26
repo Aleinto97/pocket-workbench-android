@@ -428,9 +428,12 @@ impl OpenClBackend {
             Some(b) => *b,
             None => {
                 let mut err = 0;
+                // COPY_HOST_PTR, not USE_HOST_PTR: GGUF tensor slices are only
+                // 32-byte aligned inside an mmap, and Adreno's driver can crash
+                // on non page-aligned host pointers with USE_HOST_PTR.
                 let b = (self.api.create_buffer)(
                     self.ctx,
-                    CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                     w.len(),
                     w.as_ptr() as *mut c_void,
                     &mut err,

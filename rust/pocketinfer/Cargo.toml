@@ -1,6 +1,6 @@
 [package]
 name = "pocketinfer"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Pocket Workbench on-device LLM inference engine (pure Rust, no external crates)"
 license = "MIT"
