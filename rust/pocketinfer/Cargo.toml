@@ -1,0 +1,22 @@
+[package]
+name = "pocketinfer"
+version = "0.3.0"
+edition = "2021"
+description = "Pocket Workbench on-device LLM inference engine (pure Rust, no external crates)"
+license = "MIT"
+
+[lib]
+name = "pocketinfer"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1

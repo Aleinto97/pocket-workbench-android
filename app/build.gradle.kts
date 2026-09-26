@@ -11,14 +11,12 @@ android {
         applicationId = "com.pocketworkbench.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.2.10"
+        versionCode = 12
+        versionName = "0.3.0"
         ndk { abiFilters += "arm64-v8a" }
         externalNativeBuild { cmake {
             cppFlags += "-std=c++17"
-            arguments += listOf("-DGGML_NATIVE=OFF", "-DGGML_OPENMP=OFF", "-DGGML_LLAMAFILE=OFF", "-DLLAMA_OPENSSL=OFF", "-DGGML_VULKAN=${if (providers.gradleProperty("gpu").orNull == "true") "ON" else "OFF"}")
-            providers.environmentVariable("SPIRV_HEADERS_CMAKE_DIR").orNull?.let { arguments += "-DSPIRV-Headers_DIR=$it" }
-            providers.environmentVariable("VULKAN_HEADERS_DIR").orNull?.let { arguments += "-DGGML_VULKAN_EXTRA_INCLUDE_DIR=$it" }
+            arguments += listOf("-DGGML_NATIVE=OFF", "-DGGML_OPENMP=OFF")
         } }
     }
     buildFeatures { compose = true }
@@ -44,8 +42,18 @@ android {
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
     externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("rustjni"))
     packaging { jniLibs.useLegacyPackaging = true }
 }
+
+// Pure-Rust inference engine (rust/pocketinfer): cross-compiled by
+// scripts/build-rust.sh into app/build/rustjni/arm64-v8a/libpocketinfer.so.
+val cargoBuild = tasks.register<Exec>("cargoBuildRust") {
+    workingDir = rootProject.projectDir
+    commandLine("bash", "scripts/build-rust.sh")
+    outputs.dir(layout.buildDirectory.dir("rustjni"))
+}
+tasks.named("preBuild") { dependsOn(cargoBuild) }
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)

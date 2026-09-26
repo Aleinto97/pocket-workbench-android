@@ -13,22 +13,28 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-linux-android
       - name: Install Android SDK components
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y ninja-build glslc libvulkan-dev spirv-headers
-          mkdir -p "$GITHUB_WORKSPACE/build-headers"
-          cp -a /usr/include/vulkan /usr/include/spirv "$GITHUB_WORKSPACE/build-headers/"
-          echo "VULKAN_HEADERS_DIR=$GITHUB_WORKSPACE/build-headers" >> "$GITHUB_ENV"
-          echo "SPIRV_HEADERS_CMAKE_DIR=$(dirname "$(dpkg -L spirv-headers | grep '/SPIRV-HeadersConfig.cmake$' | head -1)")" >> "$GITHUB_ENV"
+          sudo apt-get install -y ninja-build
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
-      - name: Fetch native runtimes
+      - name: Fetch native runtimes (whisper.cpp only)
         run: bash scripts/fetch-native.sh
+      - name: Test and build the Rust engine
+        run: |
+          (cd rust/pocketinfer && cargo test --release)
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          bash scripts/build-rust.sh
       - name: Build
-        run: gradle :app:assembleDebug -Pgpu=true --stacktrace
+        run: gradle :app:assembleDebug --stacktrace
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -51,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v0.2.${{ github.run_number }}"
+          TAG="v0.3.${{ github.run_number }}"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
             --title "Pocket Workbench $TAG (debug)" \
             --notes "Automated debug APK from commit ${{ github.sha }}. Engineering preview: not device-validated." || \

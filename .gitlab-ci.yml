@@ -15,18 +15,16 @@ build-apk:
     paths:
       - .gradle-home/caches
       - .gradle-home/wrapper
+      - rust/pocketinfer/target
   script:
     - apt-get update -qq && apt-get install -y -qq software-properties-common >/dev/null
     - add-apt-repository -y universe >/dev/null
-    - apt-get update -qq && apt-get install -y -qq curl unzip git build-essential ninja-build glslc libvulkan-dev spirv-headers >/dev/null
-    # The Android NDK toolchain hides host CMake packages from find_package().
-    - 'export SPIRV_HEADERS_CMAKE_DIR=$(dirname "$(dpkg -L spirv-headers | grep "/SPIRV-HeadersConfig.cmake$" | head -1)")'
-    - 'test -f "$SPIRV_HEADERS_CMAKE_DIR/SPIRV-HeadersConfig.cmake"'
-    # The NDK has Vulkan C headers but no Vulkan-Hpp or SPIR-V C++ headers.
-    # Stage only these header trees: do not add the host's entire /usr/include.
-    - mkdir -p "$CI_PROJECT_DIR/build-headers"
-    - cp -a /usr/include/vulkan /usr/include/spirv "$CI_PROJECT_DIR/build-headers/"
-    - export VULKAN_HEADERS_DIR="$CI_PROJECT_DIR/build-headers"
+    - apt-get update -qq && apt-get install -y -qq curl unzip git build-essential ninja-build pkg-config libssl-dev >/dev/null
+    # --- Rust toolchain (pure-Rust inference engine) ---
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
+    - . "$HOME/.cargo/env"
+    - rustup target add aarch64-linux-android
+    - cargo --version
     # --- Android SDK cmdline-tools ---
     - mkdir -p "$ANDROID_HOME/cmdline-tools"
     - curl -sSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
@@ -34,22 +32,25 @@ build-apk:
     - mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
     - yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
     - $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1" >/dev/null
+    - export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
     # --- Gradle 8.11.1 ---
     - curl -sSL -o /tmp/gradle.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
     - unzip -q /tmp/gradle.zip -d /opt
     - export PATH="/opt/gradle-8.11.1/bin:$PATH"
     - gradle --version | head -5
-    # --- Native deps (llama.cpp / whisper.cpp) ---
+    # --- Native deps (whisper.cpp only: the LLM engine is Rust) ---
     - bash scripts/fetch-native.sh
+    # --- Rust engine unit/smoke tests (host) + cross build for arm64 ---
+    - (cd rust/pocketinfer && cargo test --release)
+    - bash scripts/build-rust.sh
     # --- Build APK debug ---
-    - gradle :app:assembleDebug -Pgpu=true --no-daemon --stacktrace
+    - gradle :app:assembleDebug --no-daemon --stacktrace
     - APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
     - cp "$APK" PocketWorkbench-debug.apk
     - ls -la PocketWorkbench-debug.apk
-    # --- Unstripped native libs: needed to symbolicate native crash reports
-    # (bridge.cpp writes pc=<lib>+0xoffset; llvm-symbolizer needs these exact .so)
+    # --- Unstripped native libs: needed to symbolicate native crash reports ---
     - 'SYMDIR=$( (ls -d app/build/intermediates/cxx/Debug/*/obj/arm64-v8a app/build/intermediates/cxx/Release/*/obj/arm64-v8a app/.cxx/Debug/*/obj/arm64-v8a app/.cxx/Release/*/obj/arm64-v8a 2>/dev/null || true) | head -1 )'
-    - 'if [ -n "$SYMDIR" ] && ls "$SYMDIR"/*.so >/dev/null 2>&1; then mkdir -p native-symbols && cp "$SYMDIR"/*.so native-symbols/ && tar czf native-symbols.tgz -C native-symbols . && ls -la native-symbols; else echo "WARN no unstripped native libs (SYMDIR=$SYMDIR)"; fi'
+    - 'if [ -n "$SYMDIR" ] && ls "$SYMDIR"/*.so >/dev/null 2>&1; then mkdir -p native-symbols && cp "$SYMDIR"/*.so native-symbols/ && cp rust/pocketinfer/target/aarch64-linux-android/release/libpocketinfer.so native-symbols/ 2>/dev/null; tar czf native-symbols.tgz -C native-symbols . && ls -la native-symbols; else echo "WARN no unstripped native libs"; fi'
     # --- Pubblica APK nel registry dei pacchetti (URL di download stabile) ---
     - |
       APP_VERSION=$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p' app/build.gradle.kts | head -1)

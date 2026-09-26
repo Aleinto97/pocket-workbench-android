@@ -27,6 +27,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private val workspaceTools = WorkspaceTools(app, store.workspace)
     private val hub = HubClient()
     private val native = NativeEngine()
+    private val speechEngine = SpeechEngine()
     private val gh = GitHubClient(app)
     private val perf = PerfLog(app)
     private val config = app.getSharedPreferences("workbench_config", Context.MODE_PRIVATE)
@@ -532,7 +533,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 try {
                     val speech = installed.first { it.speech }
                     Diag.log("voice", "transcribe start (${samples.size} samples)")
-                    val text = native.transcribe(speech.file.absolutePath, samples.toFloatArray(), logDir)
+                    val text = speechEngine.transcribe(speech.file.absolutePath, samples.toFloatArray(), logDir)
                     Diag.log("voice", "transcribe done: ${text.length} chars")
                     withContext(Dispatchers.Main) { transcript = text.trim(); status = "Review and edit the transcript before sending" }
                 } catch (e: Exception) { withContext(Dispatchers.Main) { status = e.message ?: "Transcription failed" } }

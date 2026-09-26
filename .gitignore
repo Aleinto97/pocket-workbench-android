@@ -5,3 +5,6 @@ local.properties
 native/llama.cpp/
 native/whisper.cpp/
 *.apk
+rust/pocketinfer/target/
+rust/pocketinfer/.cargo/
+app/build/rustjni/
