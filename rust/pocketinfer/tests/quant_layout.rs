@@ -190,3 +190,35 @@ fn int8_q6k_random_block() {
     let tol = want.abs() * 0.02 + 0.01;
     assert!((got - want).abs() <= tol, "got {got} want {want} diff {}", got - want);
 }
+
+#[test]
+fn row_dot_multi_matches_dot_row() {
+    let mut st = 777u64;
+    let mut w = vec![0u8; 144 * 4];
+    for i in 0..w.len() {
+        w[i] = prng(&mut st) as u8;
+    }
+    for blk in 0..4 {
+        w[blk * 144..blk * 144 + 2].copy_from_slice(&0x3000u16.to_le_bytes());
+        w[blk * 144 + 2..blk * 144 + 4].copy_from_slice(&0x2800u16.to_le_bytes());
+    }
+    let k = 1024usize;
+    let b = 5usize;
+    let mut xt = vec![0f32; k * b];
+    for j in 0..k {
+        for bi in 0..b {
+            xt[j * b + bi] = ((prng(&mut st) % 2000) as f32 / 1000.0) - 1.0;
+        }
+    }
+    let mut multi = vec![0f32; b];
+    row_dot_multi(GGML_TYPE_Q4_K, &w, k, &xt, b, &mut multi);
+    let mut single = vec![0f32; b];
+    for bi in 0..b {
+        let x: Vec<f32> = (0..k).map(|j| xt[j * b + bi]).collect();
+        single[bi] = dot_row(GGML_TYPE_Q4_K, &w, k, &x);
+    }
+    for bi in 0..b {
+        let d = (multi[bi] - single[bi]).abs();
+        assert!(d <= single[bi].abs() * 1e-4 + 1e-4, "lane {bi}: multi={} single={}", multi[bi], single[bi]);
+    }
+}

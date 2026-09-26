@@ -252,6 +252,36 @@ unsafe fn build_engine(
     Ok((engine, backend, fallback))
 }
 
+unsafe fn emit_error_stats(
+    j: &Jni,
+    callback: JObject,
+    on_stats: JMethodId,
+    backend: &str,
+    threads: usize,
+    ctx: usize,
+    reasoning: &str,
+    gpu_fallback: bool,
+    error: &str,
+) {
+    if on_stats.is_null() {
+        return;
+    }
+    let json = format!(
+        "{{\"backend\":\"{}\",\"threads\":{},\"ctx\":{},\"reasoning\":\"{}\",\"load_ms\":0.0,\"model_cached\":1,\"gpu_fallback\":{},\"prefill_tokens\":0,\"prefill_ms\":0.0,\"gen_tokens\":0,\"gen_ms\":0.0,\"history_dropped\":0,\"stop\":\"error\",\"error\":\"{}\"}}",
+        json_escape_str(backend),
+        threads,
+        ctx,
+        json_escape_str(reasoning),
+        gpu_fallback,
+        json_escape_str(error)
+    );
+    let js = j.new_string_utf(&to_modified_utf8(json.as_bytes()));
+    if !js.is_null() {
+        j.call_void_method_a(callback, on_stats, &[JValue { l: js }]);
+        j.delete_local(js);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_stop(
     _env: *mut *const JniTable,
@@ -369,7 +399,10 @@ unsafe fn generate_impl(
             Err(e) => {
                 drop(guard);
                 forensics::set_phase(10);
-                j.throw_state(&format!("Cannot load GGUF model: {e}"));
+                emit_error_stats(&j, callback, on_stats, "CPU", threads, n_ctx, "automatic", false, &format!("Cannot load GGUF model: {e}"));
+                if !j.exception_check() {
+                    j.throw_state(&format!("Cannot load GGUF model: {e}"));
+                }
                 return;
             }
         }
@@ -398,9 +431,9 @@ unsafe fn generate_impl(
         prompt = chat::apply(&view, minicpm5, true);
         direct_applied = direct_answer_j != 0
             && minicpm5
-            && prompt.ends_with("assistant\n");
+            && prompt.ends_with("<|im_start|>assistant\n");
         if direct_applied {
-            prompt.push_str(" thinking\n\n\n\n");
+            prompt.push_str(chat::direct_suffix());
         }
         forensics::set_phase(4);
         tokens = engine.model.tok.encode(&prompt, true);
@@ -462,6 +495,17 @@ unsafe fn generate_impl(
         Err(e) => {
             drop(guard);
             forensics::set_phase(10);
+            emit_error_stats(
+                &j,
+                callback,
+                on_stats,
+                backend,
+                threads,
+                n_ctx,
+                if direct_applied { "direct" } else { "automatic" },
+                gpu_fallback,
+                &format!("Inference failed: {e}"),
+            );
             if !j.exception_check() {
                 j.throw_state(&format!("Inference failed: {e}"));
             }
@@ -497,4 +541,217 @@ unsafe fn generate_impl(
     forensics::set_phase(9);
     drop(guard);
     forensics::set_phase(10);
+}
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_engineInfo(
+    env: *mut *const JniTable,
+    _this: JObject,
+) -> JString {
+    let j = Jni { env };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine_info_json(&j)));
+    match result {
+        Ok(json) => j.new_string_utf(&to_modified_utf8(json.as_bytes())),
+        Err(_) => j.new_string_utf(&to_modified_utf8(b"{\"loaded\":false,\"error\":\"internal panic\"}")),
+    }
+}
+
+fn engine_info_json(_j: &Jni) -> String {
+    let mut caps = String::new();
+    caps.push_str(&format!("\"engine\":\"pocketinfer-{}\"", env!("CARGO_PKG_VERSION")));
+    caps.push_str(&format!(",\"abi\":\"aarch64\""));
+    caps.push_str(",\"neon\":true");
+    caps.push_str(&format!(",\"dotprod\":{}", crate::quant_int::int8_available()));
+    match crate::backend::opencl::probe() {
+        Some(lib) => caps.push_str(&format!(",\"opencl\":\"{}\"", json_escape_str(&lib))),
+        None => caps.push_str(",\"opencl\":null"),
+    }
+    let npu = crate::backend::npu::inspect("");
+    caps.push_str(&format!(",\"qnn\":\"{}\"", json_escape_str(&npu.description)));
+    let mut model = "null".to_string();
+    if let Ok(guard) = cache().lock() {
+        if let Some(engine) = guard.engine.as_ref() {
+            let cfg = &engine.model.cfg;
+            let mut types = String::new();
+            for (i, (ttype, bytes, count)) in engine.model.weight_stats().iter().enumerate() {
+                if i > 0 {
+                    types.push(',');
+                }
+                types.push_str(&format!(
+                    "{{\"type\":{},\"name\":\"{}\",\"bytes\":{},\"tensors\":{}}}",
+                    ttype,
+                    crate::quant::type_name(*ttype),
+                    bytes,
+                    count
+                ));
+            }
+            let fname = guard.path.rsplit('/').next().unwrap_or(&guard.path).to_string();
+            let fsize = std::fs::metadata(&guard.path).map(|m| m.len()).unwrap_or(0);
+            model = format!(
+                "{{\"file\":\"{}\",\"file_bytes\":{},\"arch\":\"{}\",\"layers\":{},\"hidden\":{},\"ff\":{},\"heads\":{},\"kv_heads\":{},\"head_dim\":{},\"vocab\":{},\"ctx\":{},\"threads\":{},\"kv_bytes\":{},\"backend\":\"{}\",\"quant\":[{}]}}",
+                json_escape_str(&fname),
+                fsize,
+                json_escape_str(&cfg.arch),
+                cfg.n_layer,
+                cfg.n_embd,
+                cfg.n_ff,
+                cfg.n_head,
+                cfg.n_head_kv,
+                cfg.head_dim,
+                engine.model.vocab_size(),
+                engine.n_ctx,
+                engine.pool.n(),
+                engine.kv_bytes(),
+                json_escape_str(&guard.backend),
+                types
+            );
+        }
+    }
+    format!("{{\"loaded\":true,{},\"model\":{}}}", caps, model)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_diagnose(
+    env: *mut *const JniTable,
+    _this: JObject,
+    path: JString,
+    threads_j: i32,
+    context_j: i32,
+) -> JString {
+    let j = Jni { env };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let model_path = j.get_string_utf(path);
+        let threads = threads_j.clamp(1, 6) as usize;
+        let n_ctx = context_j.clamp(4096, 16384) as usize;
+        let json = diagnose_json(&model_path, threads, n_ctx);
+        j.new_string_utf(&to_modified_utf8(json.as_bytes()))
+    }));
+    match result {
+        Ok(js) => js,
+        Err(_) => j.new_string_utf(&to_modified_utf8(b"{\"ok\":false,\"steps\":[{\"name\":\"panic\",\"ok\":false,\"ms\":0,\"error\":\"internal panic\"}]}")),
+    }
+}
+
+struct Diag {
+    steps: Vec<(String, bool, f64, String)>,
+    ok: bool,
+}
+
+impl Diag {
+    fn new() -> Self {
+        Self { steps: Vec::new(), ok: true }
+    }
+    fn run<T>(&mut self, name: &str, f: impl FnOnce() -> util::Result<T>) -> Option<T> {
+        let t = std::time::Instant::now();
+        match f() {
+            Ok(v) => {
+                self.steps.push((name.to_string(), true, t.elapsed().as_secs_f64() * 1000.0, String::new()));
+                Some(v)
+            }
+            Err(e) => {
+                self.steps.push((name.to_string(), false, t.elapsed().as_secs_f64() * 1000.0, e.msg));
+                self.ok = false;
+                None
+            }
+        }
+    }
+    fn steps_json(&self) -> String {
+        let mut out = String::from("[");
+        for (i, (name, ok, ms, err)) in self.steps.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"name\":\"{}\",\"ok\":{},\"ms\":{:.1},\"error\":\"{}\"}}",
+                json_escape_str(name),
+                ok,
+                ms,
+                json_escape_str(err)
+            ));
+        }
+        out.push(']');
+        out
+    }
+}
+
+fn diagnose_json(model_path: &str, threads: usize, n_ctx: usize) -> String {
+    for (i, name) in crate::forensics::PHASES.iter().enumerate() {
+        if *name == "load_model" {
+            crate::forensics::PHASE.store(i as i32, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let mut d = Diag::new();
+    d.run("file", || {
+        if model_path.is_empty() {
+            bail!("no model selected");
+        }
+        let md = std::fs::metadata(model_path).map_err(|e| crate::err!("{e}"))?;
+        if md.len() < 1024 {
+            bail!("file too small ({} bytes)", md.len());
+        }
+        use std::io::Read;
+        let mut f = std::fs::File::open(model_path).map_err(|e| crate::err!("{e}"))?;
+        let mut hdr = [0u8; 8];
+        f.read_exact(&mut hdr).map_err(|e| crate::err!("{e}"))?;
+        let v = crate::gguf::parse_version(&hdr)?;
+        Ok((md.len(), v))
+    });
+    if d.ok {
+        let g = d.run("gguf_metadata", || crate::gguf::Gguf::load(model_path));
+        if let Some(g) = g {
+            d.run("config", || crate::model::Config::from_gguf(&g).map(|c| c));
+            let tok = d.run("tokenizer", || {
+                let tok = crate::tokenizer::Tokenizer::from_gguf(&g)?;
+                let ids = tok.encode("Ciao mondo 123", true);
+                if ids.is_empty() {
+                    bail!("tokenizer produced no tokens");
+                }
+                Ok(tok)
+            });
+            let _ = tok;
+            if d.ok {
+                let engine = d.run("engine_load", || crate::model::Engine::load(model_path, n_ctx, threads));
+                if let Some(mut engine) = engine {
+                    let ids = engine.model.tok.encode("Ciao", true);
+                    let b = ids.len().max(1);
+                    d.run("prefill", || {
+                        let positions: Vec<usize> = (0..b).collect();
+                        engine.forward(&ids, &positions, true)
+                    });
+                    d.run("sample", || {
+                        let lg = engine.logits();
+                        if lg.is_empty() {
+                            bail!("no logits produced");
+                        }
+                        Ok(())
+                    });
+                }
+            }
+        }
+    }
+    let caps = format!(
+        "\"engine\":\"pocketinfer-{}\",\"dotprod\":{},\"opencl\":{},\"threads\":{},\"ctx\":{}",
+        env!("CARGO_PKG_VERSION"),
+        crate::quant_int::int8_available(),
+        crate::backend::opencl::probe().map(|s| format!("\"{}\"", json_escape_str(&s))).unwrap_or_else(|| "null".into()),
+        threads,
+        n_ctx
+    );
+    format!("{{\"ok\":{},\"caps\":{{{}}},\"steps\":{}}}", d.ok, caps, d.steps_json())
 }

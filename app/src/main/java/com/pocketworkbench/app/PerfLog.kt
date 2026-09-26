@@ -36,7 +36,8 @@ data class PerfEntry(
     val foreground: Boolean = true,
     val contextTokens: Int = 4096,
     val historyDropped: Int = 0,
-    val reasoning: String = "automatic"
+    val reasoning: String = "automatic",
+    val error: String = ""
 ) {
     val genTps: Double get() = if (genMs > 0) genTokens / (genMs / 1000.0) else 0.0
     val prefillTps: Double get() = if (prefillMs > 0) prefillTokens / (prefillMs / 1000.0) else 0.0
@@ -55,6 +56,7 @@ data class PerfEntry(
         val ttft = if (ttftMs > 0) String.format(Locale.US, "%.1fs", ttftMs / 1000.0) else "-"
         val flags = buildList {
             if (gpuFallback) add("GPU-fallback")
+            if (error.isNotBlank()) add("error")
             if (cached) add("model-cached")
             if (!foreground) add("backgrounded")
             if (thermal.isNotBlank() && thermal != "none") add("thermal=$thermal")
@@ -107,9 +109,10 @@ class PerfLog(private val context: Context) {
     private fun detectProblem(e: PerfEntry): String {
         val issues = mutableListOf<String>()
         if (e.gpuFallback) issues.add("GPU load failed: fell back to CPU")
+        if (e.error.isNotBlank()) issues.add(e.error)
         when (e.stop) {
             "context_full" -> issues.add("Context overflow (${e.contextTokens}-token window)")
-            "error" -> issues.add("Inference error during generation")
+            "error" -> if (e.error.isBlank()) issues.add("Inference error during generation")
             "max_tokens" -> issues.add("Reply hit the max-token cap")
             else -> {}
         }
@@ -141,7 +144,8 @@ class PerfLog(private val context: Context) {
             foreground = stats.optBoolean("fg", true),
             contextTokens = stats.optInt("ctx", 4096),
             historyDropped = stats.optInt("history_dropped", 0),
-            reasoning = stats.optString("reasoning", "automatic")
+            reasoning = stats.optString("reasoning", "automatic"),
+            error = stats.optString("error", "")
         )
         val withProblem = entry.copy(problem = detectProblem(entry))
         add(withProblem)
@@ -160,7 +164,8 @@ class PerfLog(private val context: Context) {
                     .put("device", e.deviceModel).put("soc", e.soc).put("android", e.android)
                     .put("ram_total", e.totalRamMb).put("ram_free", e.freeRamMb).put("problem", e.problem)
                     .put("ttft", e.ttftMs).put("pss", e.pssMb).put("thermal", e.thermal).put("fg", e.foreground)
-                    .put("ctx", e.contextTokens).put("history_dropped", e.historyDropped).put("reasoning", e.reasoning))
+                    .put("ctx", e.contextTokens).put("history_dropped", e.historyDropped).put("reasoning", e.reasoning)
+                    .put("error", e.error))
             }
             val temp = File(file.parentFile, "perf_log.tmp")
             temp.writeText(array.toString())
@@ -187,7 +192,7 @@ class PerfLog(private val context: Context) {
                     ttftMs = o.optDouble("ttft", 0.0), pssMb = o.optInt("pss", 0),
                     thermal = o.optString("thermal"), foreground = o.optBoolean("fg", true),
                     contextTokens = o.optInt("ctx", 4096), historyDropped = o.optInt("history_dropped", 0),
-                    reasoning = o.optString("reasoning", "automatic")
+                    reasoning = o.optString("reasoning", "automatic"), error = o.optString("error", "")
                 )
             }.forEach { entries.add(it) }
         } catch (_: Exception) {}
@@ -197,7 +202,7 @@ class PerfLog(private val context: Context) {
         val sb = StringBuilder()
         sb.appendLine("Pocket Workbench — technical performance log")
         sb.appendLine("Device: ${device.summary()}")
-        sb.appendLine("Inference: llama.cpp (CPU + optional Vulkan GPU; NPU not used by this build)")
+        sb.appendLine("Inference: Rust pocketinfer engine (CPU NEON/int8; OpenCL GPU experimental; QNN NPU detection)")
         sb.appendLine("Exported: ${SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())}")
         sb.appendLine("Runs recorded: ${entries.size}")
         sb.appendLine()
@@ -213,10 +218,16 @@ class PerfLog(private val context: Context) {
             problems.forEach { sb.appendLine("- ${SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(it.timestamp))} [${it.model}] ${it.problem}") }
         }
         val cpu = entries.filter { it.backend.startsWith("CPU") }
-        val gpu = entries.filter { it.backend.startsWith("Vulkan") }
+        val gpu = entries.filter { it.backend.startsWith("OpenCL") }
         sb.appendLine()
         fun avg(list: List<PerfEntry>) = if (list.isEmpty()) 0.0 else list.map { it.genTps }.average()
-        sb.appendLine(String.format(Locale.US, "Summary: %d CPU runs (avg %.1f tok/s), %d Vulkan GPU runs (avg %.1f tok/s)", cpu.size, avg(cpu), gpu.size, avg(gpu)))
+        sb.appendLine(String.format(Locale.US, "Summary: %d CPU runs (avg %.1f tok/s), %d OpenCL GPU runs (avg %.1f tok/s)", cpu.size, avg(cpu), gpu.size, avg(gpu)))
+        val errors = entries.filter { it.error.isNotBlank() }
+        if (errors.isNotEmpty()) {
+            sb.appendLine()
+            sb.appendLine("Engine errors:")
+            errors.forEach { sb.appendLine("- ${SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(it.timestamp))} [${it.model}] ${it.error}") }
+        }
         return sb.toString()
     }
 }

@@ -20,56 +20,59 @@ pub fn apply_minicpm5(messages: &[Message], add_generation_prompt: bool) -> Stri
     let mut out = String::from("<s>");
     if let Some(first) = messages.first() {
         if first.role == "system" {
-            out.push_str("system\n");
+            out.push_str("<|im_start|>system\n");
             out.push_str(&first.content);
-            out.push('\n');
+            out.push_str("<|im_end|>\n");
         }
     }
     let mut i = 0usize;
     while i < messages.len() {
         let m = &messages[i];
         if m.role == "user" || (m.role == "system" && i > 0) {
+            out.push_str("<|im_start|>");
             out.push_str(&m.role);
             out.push('\n');
             out.push_str(&m.content);
-            out.push('\n');
+            out.push_str("<|im_end|>\n");
         } else if m.role == "assistant" {
             let mut content = m.content.clone();
             let mut reasoning = String::new();
             if content.contains("</think>") {
                 let head = content.split("</think>").next().unwrap_or("");
-                reasoning = head.split(" thinking").last().unwrap_or("").to_string();
+                reasoning = head.split("<think>").last().unwrap_or("").to_string();
                 reasoning = rstrip_nl(&reasoning).to_string();
                 content = lstrip_nl(content.split("</think>").last().unwrap_or("")).to_string();
             }
+            out.push_str("<|im_start|>assistant\n");
             if !reasoning.is_empty() {
-                out.push_str("assistant\n<think>\n");
+                out.push_str("<think>\n");
                 out.push_str(reasoning.trim_matches('\n'));
-                out.push_str("\n\n\n");
+                out.push_str("\n</think>\n\n");
                 out.push_str(lstrip_nl(&content));
-            } else if !content.contains(" thinking") && !content.contains("</think>") {
-                out.push_str("assistant\n thinking\n\n\n\n");
+            } else if !content.contains("<think>") && !content.contains("</think>") {
+                out.push_str("<think>\n\n</think>\n\n");
                 out.push_str(lstrip_nl(&content));
             } else {
-                out.push_str("assistant\n");
                 out.push_str(&content);
             }
-            out.push('\n');
+            out.push_str("<|im_end|>\n");
         } else if m.role == "tool" {
-            out.push_str("user");
+            out.push_str("<|im_start|>user");
             while i < messages.len() && messages[i].role == "tool" {
-                out.push_str("\n<tool_response>\n");
+                out.push_str("\n");
+                out.push_str("<tool_response>\n");
                 out.push_str(&messages[i].content);
-                out.push_str("\n</tool_response>");
+                out.push_str("\n");
+                out.push_str("</tool_response>");
                 i += 1;
             }
-            out.push('\n');
+            out.push_str("<|im_end|>\n");
             continue;
         }
         i += 1;
     }
     if add_generation_prompt {
-        out.push_str("assistant\n");
+        out.push_str("<|im_start|>assistant\n");
     }
     out
 }
@@ -95,4 +98,12 @@ pub fn apply(messages: &[Message], minicpm5: bool, add_generation_prompt: bool) 
     } else {
         apply_generic(messages, add_generation_prompt)
     }
+}
+
+pub fn thinking_on_suffix() -> &'static str {
+    "<think>\n"
+}
+
+pub fn direct_suffix() -> &'static str {
+    "<think>\n\n</think>\n\n"
 }

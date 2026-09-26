@@ -64,11 +64,11 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     var agentMode by androidx.compose.runtime.mutableStateOf(config.getBoolean("agent_mode", true)); private set
     var toolStatus by androidx.compose.runtime.mutableStateOf(""); private set
 
-    // llama.cpp #28878 (SIGSEGV in CPU path with 6+ threads on Android/aarch64):
-    // default 4 compute threads, user-tunable in Models > Compute threads.
+    // Rust engine worker pool: 4 threads is the measured optimum on the
+    // reference Snapdragon device; the JNI bridge clamps requests to 1..6.
     var genThreads by androidx.compose.runtime.mutableStateOf(config.getInt("gen_threads", 4)); private set
     fun applyGenThreads(n: Int) {
-        genThreads = n.coerceIn(1, 8)
+        genThreads = n.coerceIn(1, 6)
         config.edit().putInt("gen_threads", genThreads).apply()
         Diag.log("config", "gen_threads=$genThreads")
     }
@@ -100,6 +100,51 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         }
         config.edit().putBoolean("use_gpu", enabled).apply()
         Diag.log("config", "gpu_requested=$enabled")
+    }
+
+    // ---------- Engine diagnostics (Stats) ----------
+    var engineRefresh by androidx.compose.runtime.mutableIntStateOf(0); private set
+    var healthRunning by androidx.compose.runtime.mutableStateOf(false); private set
+    var healthReport by androidx.compose.runtime.mutableStateOf<DiagReport?>(null); private set
+    var lastEngineError by androidx.compose.runtime.mutableStateOf(""); private set
+
+    fun engineInfoJson(): String = native.infoJson()
+
+    fun refreshEngineInfo() { engineRefresh++ }
+
+    fun runHealthCheck() {
+        val model = selectedModel ?: installed.firstOrNull()
+        if (model == null) { status = "Select or import a model first"; return }
+        if (healthRunning) return
+        healthRunning = true
+        viewModelScope.launch(Dispatchers.IO) {
+            Diag.log("health", "start model=${model.name} threads=$genThreads ctx=$contextTokens")
+            val json = native.diagnoseJson(model.file.absolutePath, genThreads, contextTokens)
+            val report = try { EngineStatsParser.parseDiag(json) } catch (t: Throwable) { null }
+            withContext(Dispatchers.Main) {
+                healthReport = report
+                healthRunning = false
+                status = if (report?.ok == true) "Health check passed" else "Health check failed: see Stats"
+                if (report?.ok != true) {
+                    report?.steps?.firstOrNull { !it.ok }?.let { lastEngineError = "${it.name}: ${it.error}" }
+                }
+                refreshEngineInfo()
+            }
+            Diag.log("health", "done ok=${report?.ok} steps=${report?.steps?.size}")
+        }
+    }
+
+    private fun engineFailure(model: LocalModel, buffer: StringBuilder, t: Throwable) {
+        val msg = t.message ?: t.toString()
+        lastEngineError = msg
+        Diag.log("gen", "engine error: $msg")
+        try {
+            val stats = JSONObject().put("backend", "engine-error").put("stop", "error").put("error", msg)
+                .put("ctx", contextTokens).put("threads", genThreads)
+            perf.record(model.name, enriched(stats))
+        } catch (e: Exception) { Diag.log("stats", "error record FAILED: ${e.message}") }
+        buffer.append("\n\n[engine error] ").append(msg)
+        refreshEngineInfo()
     }
 
     private var generation: Job? = null
@@ -228,6 +273,28 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     // ---------- Performance log ----------
     val perfEntries: List<PerfEntry> get() = perf.entries
     fun exportPerfLog(): String = perf.exportText()
+
+    fun exportFullReport(): String {
+        val sb = StringBuilder()
+        sb.appendLine("Pocket Workbench — full diagnostic report")
+        sb.appendLine("Generated: ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date())}")
+        sb.appendLine("Native load error: ${NativeEngine.loadError ?: "none"}")
+        sb.appendLine()
+        sb.appendLine("== ENGINE ==")
+        sb.appendLine(engineInfoJson())
+        sb.appendLine()
+        sb.appendLine("== HEALTH CHECK ==")
+        healthReport?.let { r ->
+            sb.appendLine(if (r.ok) "PASSED" else "FAILED")
+            r.steps.forEach { sb.appendLine("[${if (it.ok) "OK" else "FAIL"}] ${it.name} ${String.format(java.util.Locale.US, "%.1f", it.ms)} ms ${it.error}") }
+        } ?: sb.appendLine("not run")
+        sb.appendLine()
+        sb.appendLine("== DIAGNOSTICS ==")
+        sb.appendLine(exportDiag())
+        sb.appendLine()
+        sb.append(perf.exportText())
+        return sb.toString()
+    }
     fun clearPerfLog() { perf.clear(); status = "Performance log cleared" }
     fun deviceSummary(): String = perf.device.summary()
 
@@ -411,19 +478,23 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         val (roles, texts) = withContext(Dispatchers.Main) { modelSnapshot(chatId, replyIndex, includeSystem = false) }
         val buffer = StringBuilder()
         Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""} replyIndex=$replyIndex")
-        native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
-            override fun onToken(piece: String) {
-                if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
-                buffer.append(piece); tokenCount++
-                streamThrottled(chatId, replyIndex, buffer)
-            }
-            override fun onStats(json: String) {
-                nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
-                Diag.log("stats", "received: $json")
-                val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
-                entry?.let { viewModelScope.launch(Dispatchers.Main) { liveBackend = it.backend; attachPerf(chatId, replyIndex, it.chip()) } }
-            }
-        }, logDir, genThreads, contextTokens, useGpu, directAnswer)
+        try {
+            native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
+                override fun onToken(piece: String) {
+                    if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
+                    buffer.append(piece); tokenCount++
+                    streamThrottled(chatId, replyIndex, buffer)
+                }
+                override fun onStats(json: String) {
+                    nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
+                    Diag.log("stats", "received: $json")
+                    val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
+                    entry?.let { viewModelScope.launch(Dispatchers.Main) { liveBackend = it.backend; attachPerf(chatId, replyIndex, it.chip()) } }
+                }
+            }, logDir, genThreads, contextTokens, useGpu, directAnswer)
+        } catch (t: Throwable) {
+            engineFailure(model, buffer, t)
+        }
         withContext(Dispatchers.Main) { flushBuffer(chatId, replyIndex, buffer.toString()) }
         persist()
         Diag.log("gen", "local turn done: tokens=${if (nativeGenTokens > 0) nativeGenTokens else tokenCount} (chunks=$tokenCount) ttft=${firstTokenMs}ms chars=${buffer.length}")
@@ -441,19 +512,26 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             val stepReplyIndex = replyIndex
             withContext(Dispatchers.Main) { status = if (step == 0) "Agent: thinking…" else "Agent: step ${step + 1}" }
             Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size} ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""}")
-            native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
-                override fun onToken(piece: String) {
-                    if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
-                    buffer.append(piece); tokenCount++
-                    streamThrottled(chatId, stepReplyIndex, buffer)
-                }
-                override fun onStats(json: String) {
-                    nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
-                    Diag.log("stats", "step $step received: $json")
-                    val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
-                    if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { liveBackend = entry.backend; attachPerf(chatId, stepReplyIndex, entry.chip()) } }
-                }
-            }, logDir, genThreads, contextTokens, useGpu, directAnswer)
+            var stepFailed = false
+            try {
+                native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
+                    override fun onToken(piece: String) {
+                        if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
+                        buffer.append(piece); tokenCount++
+                        streamThrottled(chatId, stepReplyIndex, buffer)
+                    }
+                    override fun onStats(json: String) {
+                        nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
+                        Diag.log("stats", "step $step received: $json")
+                        val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
+                        if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { liveBackend = entry.backend; attachPerf(chatId, stepReplyIndex, entry.chip()) } }
+                    }
+                }, logDir, genThreads, contextTokens, useGpu, directAnswer)
+            } catch (t: Throwable) {
+                engineFailure(model, buffer, t)
+                stepFailed = true
+            }
+            if (stepFailed) break
             withContext(Dispatchers.Main) { flushBuffer(chatId, stepReplyIndex, buffer.toString()) }
             if (stopRequested) break
             val parsed = McpTools.parse(buffer.toString())

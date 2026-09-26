@@ -228,6 +228,27 @@ fn sym<T: Copy>(handle: *mut c_void, name: &str) -> Result<T> {
     Ok(unsafe { core::mem::transmute_copy::<*mut c_void, T>(&p) })
 }
 
+pub fn probe() -> Option<String> {
+    let candidates = [
+        "libOpenCL.so",
+        "libOpenCL_adreno.so",
+        "/vendor/lib64/libOpenCL.so",
+        "/system/vendor/lib64/libOpenCL.so",
+        "/vendor/lib/libOpenCL.so",
+        "/system/lib64/libOpenCL.so",
+    ];
+    for c in candidates {
+        let mut b = Vec::with_capacity(c.len() + 1);
+        b.extend_from_slice(c.as_bytes());
+        b.push(0);
+        let h = unsafe { dlopen(b.as_ptr(), RTLD_NOW) };
+        if !h.is_null() {
+            return Some(c.to_string());
+        }
+    }
+    None
+}
+
 impl OpenClBackend {
     pub fn new() -> Result<Self> {
         let candidates = [

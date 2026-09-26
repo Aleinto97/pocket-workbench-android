@@ -5,6 +5,7 @@ use crate::tokenizer::Tokenizer;
 use crate::util::{self, f16_to_f32, f32_to_f16, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -28,7 +29,7 @@ pub struct Config {
 }
 
 impl Config {
-    fn from_gguf(g: &Gguf) -> Result<Self> {
+    pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.get_str_string("general.architecture").unwrap_or_default();
         let p = if arch.is_empty() { "llama".to_string() } else { arch.clone() };
         let get = |key: &str| {
@@ -104,31 +105,22 @@ impl TensorRef {
 struct MatJob {
     n_rows: usize,
     chunk: usize,
+    ttype: u32,
+    w: *const u8,
+    row_bytes: usize,
+    k: usize,
+    xt: *const f32,
+    b: usize,
+    out: *mut f32,
+    act: *const crate::quant_int::Q8Act,
+}
+
+
+pub struct JobShared {
+    desc: UnsafeCell<MatJob>,
     next: AtomicUsize,
-    ttype: u32,
-    w: *const u8,
-    row_bytes: usize,
-    k: usize,
-    xt: *const f32,
-    b: usize,
-    out: *mut f32,
-    act: *const crate::quant_int::Q8Act,
+    shutdown: AtomicBool,
 }
-
-struct JobDesc {
-    n_rows: usize,
-    chunk: usize,
-    ttype: u32,
-    w: *const u8,
-    row_bytes: usize,
-    k: usize,
-    xt: *const f32,
-    b: usize,
-    out: *mut f32,
-    act: *const crate::quant_int::Q8Act,
-}
-
-pub struct JobShared(UnsafeCell<JobDesc>);
 
 unsafe impl Send for JobShared {}
 unsafe impl Sync for JobShared {}
@@ -136,7 +128,7 @@ unsafe impl Sync for JobShared {}
 pub struct Pool {
     gen: Arc<AtomicUsize>,
     done: Arc<AtomicUsize>,
-    desc: Arc<JobShared>,
+    shared: Arc<JobShared>,
     workers: Vec<JoinHandle<()>>,
     n: usize,
 }
@@ -149,38 +141,49 @@ impl Pool {
         let n = n.max(1);
         let gen = Arc::new(AtomicUsize::new(0));
         let done = Arc::new(AtomicUsize::new(0));
-        let desc = Arc::new(JobShared(UnsafeCell::new(JobDesc::empty())));
+        let shared = Arc::new(JobShared {
+            desc: UnsafeCell::new(MatJob::empty()),
+            next: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        });
         let mut workers = Vec::new();
         for _ in 0..n {
             let gen = gen.clone();
             let done = done.clone();
-            let desc = desc.clone();
+            let shared = shared.clone();
             let h = thread::Builder::new()
                 .stack_size(1 << 20)
                 .spawn(move || {
                     let mut local = 0usize;
                     loop {
+                        if shared.shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
                         let mut spins = 0u32;
                         while gen.load(Ordering::Acquire) == local {
                             spins += 1;
                             if spins > 20_000 {
                                 thread::park();
                                 spins = 0;
+                                if shared.shutdown.load(Ordering::Acquire) {
+                                    return;
+                                }
                             } else {
                                 core::hint::spin_loop();
                             }
                         }
                         local = gen.load(Ordering::Acquire);
-                        let job = unsafe { &*desc.0.get() };
-                        let mut start = 0usize;
+                        if shared.shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let job = unsafe { &*shared.desc.get() };
                         loop {
-                            let r0 = start;
-                            start += job.chunk;
-                            if r0 >= job.n_rows {
+                            let start = shared.next.fetch_add(job.chunk, Ordering::Relaxed);
+                            if start >= job.n_rows {
                                 break;
                             }
-                            let end = (r0 + job.chunk).min(job.n_rows);
-                            for r in r0..end {
+                            let end = (start + job.chunk).min(job.n_rows);
+                            for r in start..end {
                                 let row = unsafe { job.w.add(r * job.row_bytes) };
                                 let row_slice =
                                     unsafe { core::slice::from_raw_parts(row, job.row_bytes) };
@@ -218,7 +221,7 @@ impl Pool {
                 .expect("worker thread");
             workers.push(h);
         }
-        Pool { gen, done, desc, workers, n }
+        Pool { gen, done, shared, workers, n }
     }
 
     pub fn n(&self) -> usize {
@@ -255,7 +258,7 @@ impl Pool {
         }
         let chunk = ((n_rows + self.n * 4 - 1) / (self.n * 4)).max(1);
         unsafe {
-            let d = &mut *self.desc.0.get();
+            let d = &mut *self.shared.desc.get();
             d.n_rows = n_rows;
             d.chunk = chunk;
             d.ttype = ttype;
@@ -267,6 +270,7 @@ impl Pool {
             d.out = out.as_mut_ptr();
             d.act = act;
         }
+        self.shared.next.store(0, Ordering::Relaxed);
         self.done.store(0, Ordering::Relaxed);
         self.gen.fetch_add(1, Ordering::Release);
         for h in &self.workers {
@@ -278,7 +282,7 @@ impl Pool {
     }
 }
 
-impl JobDesc {
+impl MatJob {
     fn empty() -> Self {
         Self {
             n_rows: 0,
@@ -297,7 +301,8 @@ impl JobDesc {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.gen.fetch_add(1_000_000, Ordering::Release);
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.gen.fetch_add(1, Ordering::Release);
         for h in self.workers.drain(..) {
             h.thread().unpark();
             let _ = h.join();
@@ -514,6 +519,18 @@ impl Model {
         self.tensors.iter().map(|t| t.name.as_str()).collect()
     }
 
+    pub fn weight_stats(&self) -> Vec<(u32, u64, usize)> {
+        use std::collections::BTreeMap;
+        let mut map: BTreeMap<u32, (u64, usize)> = BTreeMap::new();
+        for t in &self.tensors {
+            let bytes = (t.row_bytes * t.ne1) as u64;
+            let e = map.entry(t.ttype).or_insert((0, 0));
+            e.0 += bytes;
+            e.1 += 1;
+        }
+        map.into_iter().map(|(t, (b, c))| (t, b, c)).collect()
+    }
+
     pub fn tensor_list(&self) -> Vec<(String, u32, usize, usize)> {
         self.tensors
             .iter()
@@ -630,6 +647,10 @@ impl Engine {
         }
         self.pool
             .matmul(w.ttype, ptr, w.row_bytes, w.ne0, x, b, out, w.ne1, core::ptr::null());
+    }
+
+    pub fn kv_bytes(&self) -> usize {
+        self.kv.k.len() * 2 + self.kv.v.len() * 2
     }
 
     pub fn enable_opencl(&mut self) -> Result<()> {
@@ -949,6 +970,26 @@ impl Engine {
         }
         self.pool
             .matmul(t.ttype, ptr, t.row_bytes, t.ne0, x, b, out, t.ne1, core::ptr::null());
+        Ok(())
+    }
+
+    pub fn debug_matmul_scalar(&mut self, name: &str, x: &[f32], b: usize, out: &mut [f32]) -> Result<()> {
+        let t = self
+            .model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .cloned()
+            .ok_or_else(|| crate::err!("no tensor {name}"))?;
+        let base = self.model.gguf.file.as_ptr();
+        let row_bytes = t.row_bytes;
+        for r in 0..t.ne1 {
+            let row = unsafe { core::slice::from_raw_parts(base.add(t.off + r * row_bytes), row_bytes) };
+            for lane in 0..b {
+                let xr: Vec<f32> = (0..t.ne0).map(|j| x[j * b + lane]).collect();
+                out[r * b + lane] = crate::quant::dot_row(t.ttype, row, t.ne0, &xr);
+            }
+        }
         Ok(())
     }
 
