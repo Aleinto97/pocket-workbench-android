@@ -242,6 +242,7 @@ pub fn probe() -> Option<String> {
         "/vendor/lib/libOpenCL.so",
         "/system/lib64/libOpenCL.so",
     ];
+    let mut blocked: Option<String> = None;
     for c in candidates {
         let mut b = Vec::with_capacity(c.len() + 1);
         b.extend_from_slice(c.as_bytes());
@@ -250,8 +251,11 @@ pub fn probe() -> Option<String> {
         if !h.is_null() {
             return Some(c.to_string());
         }
+        if blocked.is_none() && std::path::Path::new(c).exists() {
+            blocked = Some(format!("{c} (present, blocked by linker namespace)"));
+        }
     }
-    None
+    blocked
 }
 
 impl OpenClBackend {

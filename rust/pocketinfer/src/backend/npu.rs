@@ -37,6 +37,7 @@ pub fn inspect(model_path: &str) -> NpuStatus {
         "/vendor/lib64/libQnnHtpV79Stub.so",
     ];
     let mut runtime_lib = None;
+    let mut blocked: Option<String> = None;
     for c in lib_candidates {
         let mut b = Vec::with_capacity(c.len() + 1);
         b.extend_from_slice(c.as_bytes());
@@ -46,6 +47,12 @@ pub fn inspect(model_path: &str) -> NpuStatus {
             runtime_lib = Some(c.to_string());
             break;
         }
+        if blocked.is_none() && std::path::Path::new(c).exists() {
+            blocked = Some(format!("{c} (present, blocked by linker namespace)"));
+        }
+    }
+    if runtime_lib.is_none() {
+        runtime_lib = blocked;
     }
     let description = match (&context_binary, &runtime_lib) {
         (Some(bin), Some(lib)) => format!(
@@ -55,7 +62,7 @@ pub fn inspect(model_path: &str) -> NpuStatus {
             "QNN context binary {bin} found but no libQnnHtp runtime is bundled; keep GPU/CPU"
         ),
         (None, Some(lib)) => format!(
-            "{lib} present but no .qnn context binary next to the GGUF; export one with Qualcomm AI Hub to enable the NPU path"
+            "{lib}; to run on the NPU the QNN libs must be bundled in jniLibs and a .qnn context binary exported next to the GGUF (Qualcomm AI Hub)"
         ),
         (None, None) => "no Qualcomm QNN runtime or context binary on this device".to_string(),
     };
