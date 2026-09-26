@@ -11,7 +11,7 @@ class NativeEngine {
     // process deaths during inference can be diagnosed after the fact.
     // threads: llama.cpp #28878 crashes with 6+ threads on Android/aarch64;
     // the app default is 4 and the user can tune it in Models.
-    external fun generate(path: String, roles: Array<String>, contents: Array<String>, callback: TokenCallback, logDir: String, threads: Int, contextTokens: Int, useGpu: Boolean)
+    external fun generate(path: String, roles: Array<String>, contents: Array<String>, callback: TokenCallback, logDir: String, threads: Int, contextTokens: Int, useGpu: Boolean, directAnswer: Boolean)
     external fun stop()
     external fun transcribe(path: String, samples: FloatArray, logDir: String): String
 }

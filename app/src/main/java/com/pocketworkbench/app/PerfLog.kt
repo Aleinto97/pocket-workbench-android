@@ -35,7 +35,8 @@ data class PerfEntry(
     val thermal: String = "",
     val foreground: Boolean = true,
     val contextTokens: Int = 4096,
-    val historyDropped: Int = 0
+    val historyDropped: Int = 0,
+    val reasoning: String = "automatic"
 ) {
     val genTps: Double get() = if (genMs > 0) genTokens / (genMs / 1000.0) else 0.0
     val prefillTps: Double get() = if (prefillMs > 0) prefillTokens / (prefillMs / 1000.0) else 0.0
@@ -58,6 +59,7 @@ data class PerfEntry(
             if (!foreground) add("backgrounded")
             if (thermal.isNotBlank() && thermal != "none") add("thermal=$thermal")
             add("ctx=$contextTokens")
+            if (reasoning == "direct") add("direct-answer")
             if (historyDropped > 0) add("history-trimmed=$historyDropped")
         }.joinToString(",")
         return String.format(Locale.US, "| %s | %s | %s | %s | %.0f | %.1f | %d | %s | %s | %s | %s |",
@@ -138,7 +140,8 @@ class PerfLog(private val context: Context) {
             thermal = stats.optString("thermal", ""),
             foreground = stats.optBoolean("fg", true),
             contextTokens = stats.optInt("ctx", 4096),
-            historyDropped = stats.optInt("history_dropped", 0)
+            historyDropped = stats.optInt("history_dropped", 0),
+            reasoning = stats.optString("reasoning", "automatic")
         )
         val withProblem = entry.copy(problem = detectProblem(entry))
         add(withProblem)
@@ -157,7 +160,7 @@ class PerfLog(private val context: Context) {
                     .put("device", e.deviceModel).put("soc", e.soc).put("android", e.android)
                     .put("ram_total", e.totalRamMb).put("ram_free", e.freeRamMb).put("problem", e.problem)
                     .put("ttft", e.ttftMs).put("pss", e.pssMb).put("thermal", e.thermal).put("fg", e.foreground)
-                    .put("ctx", e.contextTokens).put("history_dropped", e.historyDropped))
+                    .put("ctx", e.contextTokens).put("history_dropped", e.historyDropped).put("reasoning", e.reasoning))
             }
             val temp = File(file.parentFile, "perf_log.tmp")
             temp.writeText(array.toString())
@@ -183,7 +186,8 @@ class PerfLog(private val context: Context) {
                     problem = o.optString("problem"),
                     ttftMs = o.optDouble("ttft", 0.0), pssMb = o.optInt("pss", 0),
                     thermal = o.optString("thermal"), foreground = o.optBoolean("fg", true),
-                    contextTokens = o.optInt("ctx", 4096), historyDropped = o.optInt("history_dropped", 0)
+                    contextTokens = o.optInt("ctx", 4096), historyDropped = o.optInt("history_dropped", 0),
+                    reasoning = o.optString("reasoning", "automatic")
                 )
             }.forEach { entries.add(it) }
         } catch (_: Exception) {}

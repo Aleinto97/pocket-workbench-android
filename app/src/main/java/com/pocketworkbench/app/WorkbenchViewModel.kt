@@ -61,6 +61,16 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     }
     var contextTokens by androidx.compose.runtime.mutableStateOf(config.getInt("context_tokens", 8192).coerceIn(4096, 16384)); private set
     var useGpu by androidx.compose.runtime.mutableStateOf(config.getBoolean("use_gpu", true)); private set
+    var directAnswer by androidx.compose.runtime.mutableStateOf(config.getBoolean("direct_answer", true)); private set
+    var liveThermal by androidx.compose.runtime.mutableStateOf("none"); private set
+    var liveChunks by androidx.compose.runtime.mutableIntStateOf(0); private set
+    var liveBackend by androidx.compose.runtime.mutableStateOf(""); private set
+    fun applyDirectAnswer(enabled: Boolean) {
+        if (busy) return
+        directAnswer = enabled
+        config.edit().putBoolean("direct_answer", enabled).apply()
+        Diag.log("config", "direct_answer=$enabled")
+    }
     fun applyContextTokens(n: Int) {
         if (busy) return
         contextTokens = when (n) { 4096, 8192, 16384 -> n; else -> 8192 }
@@ -298,6 +308,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         conversations[idx] = started.copy(messages = started.messages.toMutableList(), model = model.name)
         persist()
         genStartMs = SystemClock.elapsedRealtime(); firstTokenMs = 0L; tokenCount = 0; nativeGenTokens = 0; lastUiFlushMs = 0L
+        liveChunks = 0; liveBackend = ""; liveThermal = Diag.thermalName()
         Diag.log("chat", "send: model=${model.name} chars=${text.trim().length} agent=$useAgent replyIndex=$replyIndex")
         Diag.updateState("generating", "model=${model.name}")
         busy = true; toolStatus = ""
@@ -327,7 +338,9 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         while (true) {
             delay(3000)
             if (!busy) break
-            Diag.log("gen", "heartbeat: model=$modelName chunks=$tokenCount ttft=${firstTokenMs}ms ram=${Diag.freeRamMb()}MB pss=${Diag.pssMb()}MB thermal=${Diag.thermalName()} fg=${Diag.foreground}")
+            val thermal = Diag.thermalName()
+            withContext(Dispatchers.Main) { liveThermal = thermal; liveChunks = tokenCount }
+            Diag.log("gen", "heartbeat: model=$modelName chunks=$tokenCount ttft=${firstTokenMs}ms ram=${Diag.freeRamMb()}MB pss=${Diag.pssMb()}MB thermal=$thermal fg=${Diag.foreground}")
             Diag.updateState("generating", "chunks=$tokenCount model=$modelName")
             persist()
         }
@@ -379,9 +392,9 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
                 Diag.log("stats", "received: $json")
                 val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
-                entry?.let { viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, it.chip()) } }
+                entry?.let { viewModelScope.launch(Dispatchers.Main) { liveBackend = it.backend; attachPerf(chatId, replyIndex, it.chip()) } }
             }
-        }, logDir, genThreads, contextTokens, useGpu)
+        }, logDir, genThreads, contextTokens, useGpu, directAnswer)
         withContext(Dispatchers.Main) { flushBuffer(chatId, replyIndex, buffer.toString()) }
         persist()
         Diag.log("gen", "local turn done: tokens=${if (nativeGenTokens > 0) nativeGenTokens else tokenCount} (chunks=$tokenCount) ttft=${firstTokenMs}ms chars=${buffer.length}")
@@ -409,16 +422,16 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                     nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
                     Diag.log("stats", "step $step received: $json")
                     val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
-                    if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, stepReplyIndex, entry.chip()) } }
+                    if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { liveBackend = entry.backend; attachPerf(chatId, stepReplyIndex, entry.chip()) } }
                 }
-            }, logDir, genThreads, contextTokens, useGpu)
+            }, logDir, genThreads, contextTokens, useGpu, directAnswer)
             withContext(Dispatchers.Main) { flushBuffer(chatId, stepReplyIndex, buffer.toString()) }
             if (stopRequested) break
             val parsed = McpTools.parse(buffer.toString())
             if (parsed.call == null) {
                 if (parsed.attempted) {
                     Diag.log("agent", "step $step: malformed tool call, retrying with correction prompt")
-                    addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT] error: malformed tool call. Use <tool>{\"name\":\"…\",\"arguments\":{…}}</tool> or answer in plain text."))
+                    addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT] error: malformed tool call. Use <function name=\"tool_name\"><param name=\"argument\">value</param></function>, <tool> JSON, or answer in plain text."))
                     val message = if (step == 11) "Reached the 12-step limit. Send 'continue' to retry the tool call." else ""
                     withContext(Dispatchers.Main) { updateChat(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", message)) }) } }
                     replyIndex = (conversations.find { it.id == chatId }?.messages?.size ?: 1) - 1

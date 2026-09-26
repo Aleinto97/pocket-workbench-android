@@ -11,6 +11,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -83,9 +88,10 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
 
 @Composable private fun Workbench(vm: WorkbenchViewModel, onMic: () -> Unit, onImport: () -> Unit) {
     var page by remember { mutableStateOf(Page.Chat) }
-    val wide = LocalConfiguration.current.screenWidthDp >= 840
     Surface(modifier = Modifier.fillMaxSize(), color = Dark) {
-        Column {
+      BoxWithConstraints(Modifier.fillMaxSize()) {
+        val wide = maxWidth >= 840.dp
+        Column(Modifier.fillMaxSize()) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("POCKET WORKBENCH", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Indigo)
                 Spacer(Modifier.weight(1f))
@@ -93,7 +99,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             }
             HorizontalDivider(color = DividerColor)
             Row(Modifier.weight(1f)) {
-                NavigationRail(containerColor = Dark) {
+                if (wide) NavigationRail(containerColor = Dark) {
                     Spacer(Modifier.height(12.dp))
                     NavigationRailItem(selected = page == Page.Chat, onClick = { page = Page.Chat }, icon = { Icon(Icons.Default.ChatBubbleOutline, "Chat") }, label = { Text("Chat") })
                     NavigationRailItem(selected = page == Page.Models, onClick = { page = Page.Models }, icon = { Icon(Icons.Default.Download, "Models") }, label = { Text("Models") })
@@ -114,10 +120,29 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             }
             HorizontalDivider(color = DividerColor)
             Text(vm.status, modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, maxLines = 2)
+            if (!wide) NavigationBar(containerColor = Dark) {
+                listOf(Page.Chat, Page.Models, Page.Stats, Page.Workspace, Page.GitHub).forEach { destination ->
+                    val icon = when (destination) {
+                        Page.Chat -> Icons.Default.ChatBubbleOutline
+                        Page.Models -> Icons.Default.Download
+                        Page.Stats -> Icons.Default.Speed
+                        Page.Workspace -> Icons.Default.Terminal
+                        Page.GitHub -> Icons.Default.Code
+                    }
+                    NavigationBarItem(selected = page == destination, onClick = { page = destination },
+                        icon = { Icon(icon, null) }, label = { Text(if (destination == Page.Workspace) "Files" else destination.name) })
+                }
+            }
         }
+      }
     }
 }
 @Composable private fun ConversationSidebar(vm: WorkbenchViewModel, modifier: Modifier = Modifier) {
+    var deleting by remember { mutableStateOf<Conversation?>(null) }
+    deleting?.let { target -> AlertDialog(onDismissRequest = { deleting = null },
+        title = { Text("Delete conversation?") }, text = { Text("${target.title} will be removed from this device.") },
+        confirmButton = { TextButton(onClick = { vm.deleteChat(target.id); deleting = null }) { Text("Delete") } },
+        dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } }) }
     Column(modifier.padding(12.dp)) {
         Button(onClick = vm::newChat, modifier = Modifier.fillMaxWidth(), enabled = !vm.busy) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(8.dp)); Text("New chat") }
         Spacer(Modifier.height(12.dp))
@@ -129,7 +154,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                         Text(conversation.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             color = if (vm.activeId == conversation.id) Indigo else Pale)
                     }
-                    IconButton(onClick = { vm.deleteChat(conversation.id) }, enabled = !vm.busy, modifier = Modifier.size(36.dp)) {
+                    IconButton(onClick = { deleting = conversation }, enabled = !vm.busy, modifier = Modifier.size(48.dp)) {
                         Icon(Icons.Default.DeleteOutline, "Delete ${conversation.title}", modifier = Modifier.size(18.dp))
                     }
                 }
@@ -145,9 +170,17 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
     LaunchedEffect(vm.transcript) { if (vm.transcript.isNotBlank()) { draft = vm.transcript; vm.clearTranscript() } }
     val chat = vm.active
     val scroll = rememberLazyListState()
+    var followLatest by remember(chat?.id) { mutableStateOf(true) }
+    val dragged by scroll.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(dragged) { if (dragged) followLatest = false }
     val messages = chat?.messages ?: emptyList()
     val lastText = messages.lastOrNull()?.text ?: ""
-    LaunchedEffect(chat?.id, messages.size, lastText.length) { if (messages.isNotEmpty()) scroll.animateScrollToItem(messages.lastIndex) }
+    LaunchedEffect(chat?.id, messages.size, lastText.length, followLatest) {
+        if (followLatest && messages.isNotEmpty()) {
+            scroll.scrollToItem(messages.lastIndex)
+            scroll.scrollBy(100000f) // keep the end of a long streaming reply visible
+        }
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = if (compact) 16.dp else 32.dp)) {
         Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             if (compact) {
@@ -157,9 +190,15 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                 }, confirmButton = { TextButton(onClick = { vm.newChat(); showChats = false }) { Text("New chat") } })
             }
             Text(chat?.title ?: "Chat", style = MaterialTheme.typography.titleLarge, maxLines = 1, modifier = Modifier.weight(1f))
+            IconButton(onClick = {
+                clipboard.setText(AnnotatedString(vm.exportPerfLog()))
+                Toast.makeText(context, "Performance log copied", Toast.LENGTH_SHORT).show()
+            }, modifier = Modifier.semantics { contentDescription = "Copy performance log" }) { Icon(Icons.Default.ContentCopy, "Copy performance log") }
+        }
+        Row(Modifier.fillMaxWidth().padding(bottom = 8.dp).horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             if (vm.ghLoggedIn) FilterChip(selected = vm.agentMode, onClick = { vm.toggleAgentMode() },
                 label = { Text("Agent") }, leadingIcon = { Icon(Icons.Default.SmartToy, null, Modifier.size(18.dp)) })
-            Spacer(Modifier.width(8.dp))
             var expanded by remember { mutableStateOf(false) }
             Box {
                 OutlinedButton(onClick = { expanded = true }) { Text(vm.selectedModel?.name?.take(24) ?: "Choose model") }
@@ -168,30 +207,39 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                     if (vm.installed.none { !it.speech }) DropdownMenuItem(text = { Text("Download a GGUF in Models") }, onClick = { expanded = false })
                 }
             }
-            IconButton(onClick = {
-                clipboard.setText(AnnotatedString(vm.exportPerfLog()))
-                Toast.makeText(context, "Performance log copied", Toast.LENGTH_SHORT).show()
-            }, modifier = Modifier.semantics { contentDescription = "Copy performance log" }) { Icon(Icons.Default.ContentCopy, "Copy performance log") }
+            if (vm.selectedModel?.name?.contains("MiniCPM5", ignoreCase = true) == true) {
+                FilterChip(selected = vm.directAnswer, enabled = !vm.busy,
+                    onClick = { vm.applyDirectAnswer(true) }, label = { Text("Direct answer") })
+                FilterChip(selected = !vm.directAnswer, enabled = !vm.busy,
+                    onClick = { vm.applyDirectAnswer(false) }, label = { Text("Automatic reasoning") })
+            }
         }
         HorizontalDivider()
+        if (vm.busy) Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Column(Modifier.padding(12.dp)) {
+                Text(vm.toolStatus.ifBlank { vm.status }, style = MaterialTheme.typography.titleSmall, color = Indigo)
+                Text("${vm.liveBackend.ifBlank { if (vm.useGpu) "GPU requested · verifying backend" else "CPU requested" }} · ${vm.contextTokens / 1024}K context · thermal ${vm.liveThermal}",
+                    style = MaterialTheme.typography.bodySmall, color = if (vm.liveThermal in listOf("severe", "critical", "emergency")) Color(0xFFFFB4A0) else Color.LightGray)
+                if (vm.liveThermal in listOf("severe", "critical", "emergency")) Text("Device is hot; generation may slow down.", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB4A0))
+            }
+        }
         if (messages.isEmpty()) Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("What would you like to work on?", style = MaterialTheme.typography.headlineMedium)
                 Text("Your chat runs on your tablet, even when offline.", color = Color.LightGray)
             }
-        } else LazyColumn(state = scroll, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        } else Box(Modifier.weight(1f).fillMaxWidth()) {
+          LazyColumn(state = scroll, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             items(messages.size) { i ->
                 val message = messages[i]
                 when (message.role) {
-                    "tool_result" -> Surface(color = Console, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
-                        Text(message.text, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Color(0xFF9FB2CC), modifier = Modifier.padding(12.dp))
-                    }
+                    "tool_result" -> ToolResultCard(message.text)
                     else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = if (message.role == "user") Arrangement.End else Arrangement.Start) {
                         Surface(color = if (message.role == "user") Color(0xFF304C7C) else Panel, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 760.dp)) {
                             Column(Modifier.padding(16.dp)) {
                                 Text(if (message.role == "user") "YOU" else "ASSISTANT", style = MaterialTheme.typography.labelSmall, color = Indigo)
                                 Spacer(Modifier.height(6.dp))
-                                Text(message.text.ifEmpty { "Thinking…" }, style = MaterialTheme.typography.bodyLarge)
+                                if (message.role == "assistant") AssistantReply(message.text) else Text(message.text, style = MaterialTheme.typography.bodyLarge)
                                 if (message.perf.isNotBlank() && message.role == "assistant") {
                                     Spacer(Modifier.height(8.dp))
                                     AssistChip(onClick = {
@@ -204,6 +252,10 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                     }
                 }
             }
+          }
+          if (!followLatest) FilledTonalButton(onClick = { followLatest = true }, modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp)) {
+              Text("Latest ↓")
+          }
         }
         if (vm.listening) Text("Recording… Tap the microphone to stop. Maximum 30 seconds.", color = Indigo)
         Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.Bottom) {
@@ -216,12 +268,51 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
         }
     }
 }
+@Composable private fun AssistantReply(raw: String) {
+    if (raw.isEmpty()) { Text("Thinking…", style = MaterialTheme.typography.bodyLarge); return }
+    val start = raw.indexOf("<think>")
+    if (start < 0) { Text(raw, style = MaterialTheme.typography.bodyLarge); return }
+    val end = raw.indexOf("</think>", start + 7)
+    val thought = raw.substring(start + 7, if (end < 0) raw.length else end).trim()
+    val reply = (raw.substring(0, start) + if (end < 0) "" else raw.substring(end + 8)).trim()
+    var expanded by remember { mutableStateOf(false) }
+    TextButton(onClick = { expanded = !expanded }) {
+        Text(if (expanded) "Hide reasoning ↑" else if (end < 0) "Reasoning in progress ↓" else "Show reasoning ↓")
+    }
+    if (expanded) Surface(color = Console, shape = RoundedCornerShape(8.dp)) {
+        Text(thought.ifBlank { "No reasoning text yet." }, modifier = Modifier.padding(12.dp),
+            style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+    }
+    if (reply.isNotBlank()) Text(reply, style = MaterialTheme.typography.bodyLarge)
+    else if (end >= 0) Text("Preparing the final answer…", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+}
+@Composable private fun ToolResultCard(raw: String) {
+    var expanded by remember { mutableStateOf(false) }
+    val name = raw.substringAfter("[TOOL RESULT name=", "").substringBefore(']').ifBlank { "Tool result" }
+    Surface(color = Console, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
+            TextButton(onClick = { expanded = !expanded }) { Text("${if (raw.contains("\"ok\":false")) "⚠" else "✓"} $name ${if (expanded) "↑" else "↓"}") }
+            if (expanded) Text(raw, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace,
+                color = Color(0xFF9FB2CC), modifier = Modifier.padding(bottom = 8.dp))
+        }
+    }
+}
 @Composable private fun ModelsPage(vm: WorkbenchViewModel, onImport: () -> Unit) {
     var query by remember { mutableStateOf("") }
-    val scope = rememberCoroutineScope()
+    var tab by remember { mutableIntStateOf(0) }
+    var deleting by remember { mutableStateOf<LocalModel?>(null) }
+    deleting?.let { target -> AlertDialog(onDismissRequest = { deleting = null },
+        title = { Text("Delete downloaded model?") }, text = { Text("${target.name} will be removed from this device.") },
+        confirmButton = { TextButton(onClick = { vm.deleteModel(target); deleting = null }) { Text("Delete") } },
+        dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } }) }
     Column(Modifier.fillMaxSize().padding(24.dp)) {
         Text("Model library", style = MaterialTheme.typography.headlineMedium)
-        Text("Search Hugging Face GGUF models. Only downloaded files are used for inference.", color = Color.LightGray)
+        TabRow(selectedTabIndex = tab, modifier = Modifier.padding(top = 12.dp)) {
+            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Models & downloads") })
+            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Inference settings") })
+        }
+        if (tab == 0) {
+        Text("Search Hugging Face GGUF models. Only downloaded files are used for inference.", color = Color.LightGray, modifier = Modifier.padding(top = 12.dp))
         Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(query, { query = it }, label = { Text("Model or publisher") }, singleLine = true, modifier = Modifier.weight(1f))
@@ -232,24 +323,26 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             OutlinedButton(onClick = onImport) { Icon(Icons.Default.FolderOpen, null); Spacer(Modifier.width(6.dp)); Text("Import GGUF") }
             OutlinedButton(onClick = vm::installSpeechModel) { Icon(Icons.Default.Mic, null); Spacer(Modifier.width(6.dp)); Text("Download offline speech model") }
         }
+        }
+        if (tab == 1) Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 12.dp)) {
         Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.padding(12.dp)) {
                 Text("Compute threads: ${vm.genThreads}", style = MaterialTheme.typography.bodyMedium)
                 Text("4 is recommended on 8-core phones. Known llama.cpp bug (#28878): 6+ threads can crash during generation on Android. If the app closes itself mid-answer, set 2 or 1.",
                     style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp).horizontalScroll(rememberScrollState())) {
                     listOf(1, 2, 3, 4, 6, 8).forEach { n ->
                         FilterChip(selected = vm.genThreads == n, onClick = { vm.applyGenThreads(n) }, label = { Text("$n") })
                     }
                 }
                 Text("Inference backend", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp).horizontalScroll(rememberScrollState())) {
                     FilterChip(selected = vm.useGpu, onClick = { vm.applyGpu(true) }, enabled = !vm.busy, label = { Text("GPU (Vulkan, CPU fallback)") })
                     FilterChip(selected = !vm.useGpu, onClick = { vm.applyGpu(false) }, enabled = !vm.busy, label = { Text("CPU") })
                 }
                 Text("Actual backend and fallback are shown in Stats after each reply.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                 Text("Context window: ${vm.contextTokens} tokens", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp).horizontalScroll(rememberScrollState())) {
                     listOf(4096, 8192, 16384).forEach { n ->
                         FilterChip(selected = vm.contextTokens == n, onClick = { vm.applyContextTokens(n) }, enabled = !vm.busy, label = { Text("${n / 1024}K") })
                     }
@@ -257,14 +350,15 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                 Text("Larger windows need more memory and increase prompt processing time.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
             }
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        }
+        if (tab == 0) LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item { Text("DOWNLOADED", style = MaterialTheme.typography.labelMedium, color = Indigo) }
             items(vm.installed, key = { it.file.absolutePath }) { model ->
                 Surface(shape = RoundedCornerShape(12.dp), color = Panel) {
                     Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) { Text(model.name, maxLines = 1); Text("${model.file.length() / 1048576} MiB · ${if (model.speech) "Speech" else "GGUF"}", style = MaterialTheme.typography.bodySmall) }
                         if (!model.speech) TextButton(onClick = { vm.chooseModel(model) }) { Text("Use") }
-                        IconButton(onClick = { vm.deleteModel(model) }) { Icon(Icons.Default.DeleteOutline, "Delete ${model.name}") }
+                        IconButton(onClick = { deleting = model }) { Icon(Icons.Default.DeleteOutline, "Delete ${model.name}") }
                     }
                 }
             }
@@ -316,6 +410,19 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             confirmButton = { TextButton(onClick = { vm.clearPerfLog(); confirmClear = false }) { Text("Clear") } },
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } })
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 8.dp)) {
+            if (entries.isNotEmpty()) item {
+                val latest = entries.first()
+                Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text("LATEST GENERATION", style = MaterialTheme.typography.labelMedium, color = Indigo)
+                        Text("${latest.backend} · ${latest.genTokens} tokens · ${String.format(java.util.Locale.US, "%.1f", latest.genTps)} tok/s",
+                            style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 6.dp))
+                        Text("${if (latest.reasoning == "direct") "Direct answer" else "Automatic reasoning"} · ${latest.contextTokens / 1024}K context · thermal ${latest.thermal.ifBlank { "unknown" }}",
+                            style = MaterialTheme.typography.bodySmall)
+                        if (latest.problem.isNotBlank()) Text("⚠ ${latest.problem}", color = Color(0xFFFFB4A0), style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
             item {
                 Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp)) {
@@ -412,7 +519,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                         }
                         Spacer(Modifier.height(4.dp))
                         Text(String.format(java.util.Locale.US, "%s · %d threads · gen %.1f tok/s (%d tok in %.1fs) · prefill %.0f tok/s", entry.backend, entry.threads, entry.genTps, entry.genTokens, entry.genMs / 1000.0, entry.prefillTps), style = MaterialTheme.typography.bodySmall)
-                        Text(String.format(java.util.Locale.US, "Load: %s · RAM free %d MB · stop: %s", if (entry.cached) "model cached" else String.format("%.1fs", entry.loadMs / 1000.0), entry.freeRamMb, entry.stop), style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                        Text(String.format(java.util.Locale.US, "Load: %s · RAM free %d MB · stop: %s · %s", if (entry.cached) "model cached" else String.format("%.1fs", entry.loadMs / 1000.0), entry.freeRamMb, entry.stop, entry.reasoning), style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                         if (entry.problem.isNotBlank()) Text("⚠ ${entry.problem}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFFFB4A0))
                     }
                 }

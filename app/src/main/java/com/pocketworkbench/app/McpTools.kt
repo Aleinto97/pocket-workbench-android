@@ -3,6 +3,9 @@ package com.pocketworkbench.app
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
+import java.io.StringReader
 import java.net.URLEncoder
 
 data class McpToolDef(
@@ -220,18 +223,43 @@ object McpTools {
         appendLine("You are Pocket Workbench, an assistant running fully offline on an Android tablet, with GitHub tools.")
         appendLine("To call a tool, output exactly one tag with JSON, then stop and wait:")
         appendLine("<tool>{\"name\":\"github_read_file\",\"arguments\":{\"owner\":\"me\",\"repo\":\"demo\",\"path\":\"README.md\"}}</tool>")
+        appendLine("You may also use MiniCPM5's native XML form: <function name=\"github_read_file\"><param name=\"owner\">me</param><param name=\"repo\">demo</param><param name=\"path\">README.md</param></function>.")
         appendLine("After your call you will receive a message starting with [TOOL RESULT]. Never invent tool results.")
         appendLine("Call another tool, or reply with plain text when you have enough information (that ends the turn).")
-        appendLine("Rules: one <tool> per reply; owner/repo is the full repository path; file paths are repo-relative; dates are ISO.")
+        appendLine("Rules: one tool call per reply; owner and repo are separate fields; file paths are repo-relative; dates are ISO.")
         appendLine("Available tools:")
         tools.forEach { appendLine("- ${it.signature}: ${it.description}") }
     }
 
     fun parse(text: String): McpParseResult {
-        val regex = Regex("<tool>([\\s\\S]*?)</tool>", RegexOption.IGNORE_CASE)
-        val matches = regex.findAll(text).toList()
-        if (matches.isEmpty()) return McpParseResult(null, false, "")
-        val raw = matches.last().groupValues[1].trim()
+        // Ignore examples inside the model's reasoning; only the final answer
+        // may call a tool. Retain the existing JSON protocol for other models.
+        val answer = text.replace(Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE), "")
+        val jsonTag = Regex("<tool>([\\s\\S]*?)</tool>", RegexOption.IGNORE_CASE).findAll(answer).lastOrNull()
+        val xmlTag = Regex("<function\\b[^>]*>[\\s\\S]*?</function>", RegexOption.IGNORE_CASE).findAll(answer).lastOrNull()
+        if (xmlTag != null && (jsonTag == null || xmlTag.range.first > jsonTag.range.first)) {
+            val raw = xmlTag.value
+            return try {
+                val parser = XmlPullParserFactory.newInstance().newPullParser()
+                parser.setInput(StringReader(raw))
+                var name = ""
+                val arguments = JSONObject()
+                while (parser.eventType != XmlPullParser.END_DOCUMENT) {
+                    if (parser.eventType == XmlPullParser.START_TAG) when (parser.name) {
+                        "function" -> name = parser.getAttributeValue(null, "name") ?: ""
+                        "param" -> {
+                            val key = parser.getAttributeValue(null, "name") ?: ""
+                            if (key.isNotBlank()) arguments.put(key, parser.nextText())
+                        }
+                    }
+                    parser.next()
+                }
+                if (name !in byName) McpParseResult(null, true, raw)
+                else McpParseResult(McpToolCall(name, arguments), true, raw)
+            } catch (_: Exception) { McpParseResult(null, true, raw) }
+        }
+        if (jsonTag == null) return McpParseResult(null, false, "")
+        val raw = jsonTag.groupValues[1].trim()
         return try {
             val start = raw.indexOf('{'); val end = raw.lastIndexOf('}')
             if (start < 0 || end <= start) return McpParseResult(null, true, raw)

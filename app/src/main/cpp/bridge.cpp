@@ -293,7 +293,7 @@ Java_com_pocketworkbench_app_NativeEngine_stop(JNIEnv *, jobject) { stop_request
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketworkbench_app_NativeEngine_generate(
         JNIEnv * env, jobject, jstring path, jobjectArray roles, jobjectArray contents, jobject callback, jstring log_dir,
-        jint threads_j, jint context_j, jboolean use_gpu_j) {
+        jint threads_j, jint context_j, jboolean use_gpu_j, jboolean direct_answer_j) {
     stop_requested = false;
     g_gen_tokens.store(0);
     capture_thread_stack();
@@ -383,6 +383,7 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     set_phase(3); // chat_template
     const char * tmpl = llama_model_chat_template(model, nullptr);
     int n = 0;
+    bool direct_applied = false;
     std::vector<llama_token> tokens;
     // Reserve at least 1024 positions for an answer. Drop old turns by exact
     // tokenizer count, retaining the system instruction, initial request and
@@ -397,6 +398,16 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         std::string prompt(required + 1, '\0');
         llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, prompt.data(), prompt.size());
         prompt.resize(required);
+        // MiniCPM5's published chat template implements enable_thinking=false
+        // by pre-filling an empty think block after the assistant header. The
+        // low-level llama_chat_apply_template API cannot pass Jinja kwargs.
+        // Apply this model-specific prefix only when the expected assistant
+        // header is present; otherwise preserve the model's native template.
+        static const std::string assistant_header = "<|im_start|>assistant\n";
+        direct_applied = direct_answer_j && model_path.find("MiniCPM5") != std::string::npos &&
+                         prompt.size() >= assistant_header.size() &&
+                         prompt.compare(prompt.size() - assistant_header.size(), assistant_header.size(), assistant_header) == 0;
+        if (direct_applied) prompt += "<think>\n\n</think>\n\n";
         set_phase(4); // tokenize
         n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
         if (n >= 0) { llama_free(ctx); fail(env, "Tokenization failed."); return; }
@@ -501,9 +512,9 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     if (on_stats && !env->ExceptionCheck()) {
         char buf[512];
         snprintf(buf, sizeof(buf),
-            "{\"backend\":\"%s\",\"threads\":%d,\"ctx\":%d,\"load_ms\":%.1f,\"model_cached\":%d,\"gpu_fallback\":%d,"
+            "{\"backend\":\"%s\",\"threads\":%d,\"ctx\":%d,\"reasoning\":\"%s\",\"load_ms\":%.1f,\"model_cached\":%d,\"gpu_fallback\":%d,"
             "\"prefill_tokens\":%d,\"prefill_ms\":%.1f,\"gen_tokens\":%d,\"gen_ms\":%.1f,\"history_dropped\":%d,\"stop\":\"%s\"}",
-            backend.c_str(), cp.n_threads, (int) cp.n_ctx, loaded_now ? last_load_ms : 0.0,
+            backend.c_str(), cp.n_threads, (int) cp.n_ctx, direct_applied ? "direct" : "automatic", loaded_now ? last_load_ms : 0.0,
             loaded_now ? 0 : 1, gpu_fallback ? 1 : 0, n, prefill_ms, gen_tokens, gen_ms, dropped_messages, stop_reason.c_str());
         jstring js = env->NewStringUTF(buf);
         set_phase(8); // stats_callback — if the process dies here, Diag will show 'stats_callback'

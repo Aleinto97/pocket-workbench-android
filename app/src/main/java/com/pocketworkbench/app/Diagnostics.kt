@@ -70,7 +70,7 @@ object Diag {
             val whenMs = state.optLong("ts", 0L)
             val whenTxt = SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(whenMs))
             previousEndSummary = when (phase) {
-                "done", "startup" ->
+                "done", "startup", "idle" ->
                     "Previous process (pid ${state.optInt("pid")}) ended after phase '$phase' at $whenTxt " +
                         "(killed in background or swiped away, not a crash)"
                 else -> "Previous process (pid ${state.optInt("pid")}) DIED during phase '$phase'" +
