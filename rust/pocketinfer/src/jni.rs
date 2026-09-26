@@ -413,7 +413,7 @@ unsafe fn generate_impl(
         0.0
     };
     let backend = guard.backend;
-    forensics::set_backend_hint(backend);
+    forensics::set_backend_hint(if backend.starts_with("OpenCL") { "opencl" } else { "cpu" });
     let engine = guard.engine.as_mut().unwrap();
 
     let minicpm5 = chat::is_minicpm5(

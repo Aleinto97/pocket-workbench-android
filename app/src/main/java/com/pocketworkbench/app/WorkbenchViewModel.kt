@@ -73,7 +73,15 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         Diag.log("config", "gen_threads=$genThreads")
     }
     var contextTokens by androidx.compose.runtime.mutableStateOf(config.getInt("context_tokens", 8192).coerceIn(4096, 16384)); private set
-    var useGpu by androidx.compose.runtime.mutableStateOf(config.getBoolean("use_gpu", true)); private set
+    // The OpenCL GPU path is experimental: default it off, and after a native
+    // crash on the GPU path (gpu_safe_mode marker) keep it off until re-armed.
+    private val gpuDefaultMigrated: Boolean = run {
+        if (!config.getBoolean("gpu_default_off_v3", false)) {
+            config.edit().putBoolean("use_gpu", false).putBoolean("gpu_default_off_v3", true).apply()
+        }
+        true
+    }
+    var useGpu by androidx.compose.runtime.mutableStateOf(config.getBoolean("use_gpu", false)); private set
     var directAnswer by androidx.compose.runtime.mutableStateOf(config.getBoolean("direct_answer", true)); private set
     var liveThermal by androidx.compose.runtime.mutableStateOf("none"); private set
     var liveChunks by androidx.compose.runtime.mutableIntStateOf(0); private set
@@ -94,9 +102,10 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         if (busy) return
         useGpu = enabled
         if (enabled) {
-            // user explicitly re-armed the GPU: clear the post-crash safe mode
+            // user explicitly re-armed the GPU: clear the post-crash safe modes
             try { File(logDir, "vk_safe_mode").delete() } catch (_: Exception) {}
-            Diag.log("config", "vulkan safe mode cleared by user")
+            try { File(logDir, "gpu_safe_mode").delete() } catch (_: Exception) {}
+            Diag.log("config", "gpu safe mode cleared by user")
         }
         config.edit().putBoolean("use_gpu", enabled).apply()
         Diag.log("config", "gpu_requested=$enabled")
@@ -131,6 +140,17 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 refreshEngineInfo()
             }
             Diag.log("health", "done ok=${report?.ok} steps=${report?.steps?.size}")
+        }
+    }
+
+    /** GPU is used only when the user asked for it and no crash marker is set. */
+    private fun effectiveGpu(): Boolean = useGpu && !File(logDir, "gpu_safe_mode").exists()
+
+    init {
+        if (gpuDefaultMigrated && useGpu && File(logDir, "gpu_safe_mode").exists()) {
+            useGpu = false
+            config.edit().putBoolean("use_gpu", false).apply()
+            Diag.log("config", "gpu safe mode active after a native GPU crash: OpenCL disabled")
         }
     }
 
@@ -492,7 +512,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                     val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                     entry?.let { viewModelScope.launch(Dispatchers.Main) { liveBackend = it.backend; attachPerf(chatId, replyIndex, it.chip()) } }
                 }
-            }, logDir, genThreads, contextTokens, useGpu, directAnswer)
+            }, logDir, genThreads, contextTokens, effectiveGpu(), directAnswer)
         } catch (t: Throwable) {
             engineFailure(model, buffer, t)
         }
@@ -528,7 +548,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                         val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                         if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { liveBackend = entry.backend; attachPerf(chatId, stepReplyIndex, entry.chip()) } }
                     }
-                }, logDir, genThreads, contextTokens, useGpu, directAnswer)
+                }, logDir, genThreads, contextTokens, effectiveGpu(), directAnswer)
             } catch (t: Throwable) {
                 engineFailure(model, buffer, t)
                 stepFailed = true

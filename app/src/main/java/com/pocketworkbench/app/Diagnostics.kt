@@ -97,6 +97,11 @@ object Diag {
                     if (crashBackend == "vulkan") {
                         try { File(logsDir, "vk_safe_mode").writeText("1") } catch (_: Exception) {}
                     }
+                    // Rust engine: after a native crash on the OpenCL path, keep
+                    // the GPU off until the user explicitly re-arms it.
+                    if (crashBackend == "opencl") {
+                        try { File(logsDir, "gpu_safe_mode").writeText("1") } catch (_: Exception) {}
+                    }
                 }
                 nativeCrash.copyTo(File(logsDir, "native_crash_seen.txt"), overwrite = true)
             } catch (_: Exception) {}
