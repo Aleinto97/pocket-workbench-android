@@ -70,7 +70,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private val logDir: String by lazy { File(getApplication<Application>().filesDir, "logs").apply { mkdirs() }.absolutePath }
     private var genStartMs = 0L
     private var firstTokenMs = 0L
-    private var tokenCount = 0
+    private var tokenCount = 0        // counts JNI batches received (v0.2.5+ batches ~100ms of text each)
+    private var nativeGenTokens = 0   // authoritative token count from native onStats (gen_tokens)
     private var lastUiFlushMs = 0L
 
     init {
@@ -282,7 +283,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         started.messages.add(ChatMessage("assistant", ""))
         conversations[idx] = started.copy(messages = started.messages.toMutableList(), model = model.name)
         persist()
-        genStartMs = SystemClock.elapsedRealtime(); firstTokenMs = 0L; tokenCount = 0; lastUiFlushMs = 0L
+        genStartMs = SystemClock.elapsedRealtime(); firstTokenMs = 0L; tokenCount = 0; nativeGenTokens = 0; lastUiFlushMs = 0L
         Diag.log("chat", "send: model=${model.name} chars=${text.trim().length} agent=$useAgent replyIndex=$replyIndex")
         Diag.updateState("generating", "model=${model.name}")
         busy = true; toolStatus = ""
@@ -300,7 +301,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 heartbeat.cancel()
                 withContext(Dispatchers.Main) { busy = false; delay(120) }
                 persist()
-                Diag.log("chat", "turn finished: tokens=$tokenCount ttft=${firstTokenMs}ms")
+                Diag.log("chat", "turn finished: tokens=${if (nativeGenTokens > 0) nativeGenTokens else tokenCount} ttft=${firstTokenMs}ms")
             }
         }
     }
@@ -311,8 +312,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         while (true) {
             delay(3000)
             if (!busy) break
-            Diag.log("gen", "heartbeat: model=$modelName tokens=$tokenCount ttft=${firstTokenMs}ms ram=${Diag.freeRamMb()}MB pss=${Diag.pssMb()}MB thermal=${Diag.thermalName()} fg=${Diag.foreground}")
-            Diag.updateState("generating", "tokens=$tokenCount model=$modelName")
+            Diag.log("gen", "heartbeat: model=$modelName chunks=$tokenCount ttft=${firstTokenMs}ms ram=${Diag.freeRamMb()}MB pss=${Diag.pssMb()}MB thermal=${Diag.thermalName()} fg=${Diag.foreground}")
+            Diag.updateState("generating", "chunks=$tokenCount model=$modelName")
             persist()
         }
     }
@@ -356,6 +357,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 streamThrottled(chatId, replyIndex, buffer)
             }
             override fun onStats(json: String) {
+                nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
                 Diag.log("stats", "received: $json")
                 val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                 entry?.let { viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, it.chip()) } }
@@ -363,7 +365,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         }, logDir, genThreads)
         flushBuffer(chatId, replyIndex, buffer) // guarantee final text shows despite throttling
         persist()
-        Diag.log("gen", "local turn done: tokens=$tokenCount ttft=${firstTokenMs}ms chars=${buffer.length}")
+        Diag.log("gen", "local turn done: tokens=${if (nativeGenTokens > 0) nativeGenTokens else tokenCount} (chunks=$tokenCount) ttft=${firstTokenMs}ms chars=${buffer.length}")
         withContext(Dispatchers.Main) { status = "Ready" }
     }
 
@@ -383,6 +385,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                     streamThrottled(chatId, replyIndex, buffer)
                 }
                 override fun onStats(json: String) {
+                    nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
                     Diag.log("stats", "step $step received: $json")
                     val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                     if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, entry.chip()) } }
@@ -433,7 +436,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     }
 
     fun stop() {
-        Diag.log("gen", "user requested stop at tokens=$tokenCount (ttft=${firstTokenMs}ms)")
+        Diag.log("gen", "user requested stop at chunks=$tokenCount (ttft=${firstTokenMs}ms)")
         native.stop(); status = "Stopping…"
     }
 

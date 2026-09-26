@@ -104,7 +104,7 @@ class PerfLog(private val context: Context) {
         when (e.stop) {
             "context_full" -> issues.add("Context overflow (4096-token window)")
             "error" -> issues.add("Inference error during generation")
-            "max_tokens" -> issues.add("Reply hit the 512-token cap")
+            "max_tokens" -> issues.add("Reply hit the max-token cap")
             else -> {}
         }
         if (e.genTps in 0.01..1.0) issues.add(String.format(Locale.US, "Very low generation speed (%.2f tok/s)", e.genTps))

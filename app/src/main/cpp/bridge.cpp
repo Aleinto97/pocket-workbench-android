@@ -418,7 +418,12 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     // to modified UTF-8 before NewStringUTF, so token content cannot abort it.
     std::string pending;
     double last_flush_ms = -1e9;
-    for (int i = 0; ok && i < 512 && !stop_requested; ++i) {
+    // Reply length: hard cap 2048 tokens (raised from 512 in v0.2.6 — long
+    // replies were being truncated), also clamped to the remaining context
+    // window (4096 minus the prompt) so decode cannot overflow into
+    // "context_full" mid-reply.
+    const int max_gen = std::min(2048, (int) cp.n_ctx - n - 8);
+    for (int i = 0; ok && i < max_gen && !stop_requested; ++i) {
         g_last_op.store(2); // sample
         llama_token token = llama_sampler_sample(sampler, ctx, -1);
         if (llama_vocab_is_eog(vocab, token)) { stop_reason = "eog"; break; }
@@ -456,7 +461,7 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         llama_batch batch = llama_batch_get_one(&token, 1);
         g_last_op.store(8); // gen_decode
         if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
-        if ((gen_tokens & 127) == 0) { g_last_op.store(9); save_phase_state(); } // refresh native_state.txt every 128 tokens
+        if ((gen_tokens & 63) == 0) { g_last_op.store(9); save_phase_state(); } // refresh native_state.txt every 64 tokens (fresher than the 3s JVM heartbeat → crash banners show the real token count)
     }
     if (!pending.empty() && !env->ExceptionCheck()) {
         std::string mu8;
