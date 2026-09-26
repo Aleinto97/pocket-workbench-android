@@ -38,7 +38,7 @@ build-apk:
     - ls -la PocketWorkbench-debug.apk
     # --- Unstripped native libs: needed to symbolicate native crash reports
     # (bridge.cpp writes pc=<lib>+0xoffset; llvm-symbolizer needs these exact .so)
-    - SYMDIR=$(ls -d app/build/intermediates/cxx/Debug/*/obj/arm64-v8a 2>/dev/null | head -1)
+    - SYMDIR=$(ls -d app/build/intermediates/cxx/Debug/*/obj/arm64-v8a app/build/intermediates/cxx/Release/*/obj/arm64-v8a 2>/dev/null | head -1)
     - 'if [ -n "$SYMDIR" ]; then mkdir -p native-symbols && cp "$SYMDIR"/*.so native-symbols/ && tar czf native-symbols.tgz -C native-symbols . && ls -la native-symbols; else echo "WARN no unstripped native libs"; fi'
     # --- Pubblica APK nel registry dei pacchetti (URL di download stabile) ---
     - |
@@ -47,6 +47,7 @@ build-apk:
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
         --upload-file "PocketWorkbench-debug.apk" \
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/pocket-workbench/${VERSION}/PocketWorkbench-debug-${VERSION}.apk"
+    - 'if [ -f native-symbols.tgz ]; then curl --request PUT --silent --show-error --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file native-symbols.tgz "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/pocket-workbench/${VERSION}/native-symbols-${VERSION}.tgz"; echo "Simboli pubblicati: native-symbols-${VERSION}.tgz"; fi'
     - 'echo "Package pubblicato: pocket-workbench ${VERSION}"'
   artifacts:
     paths:

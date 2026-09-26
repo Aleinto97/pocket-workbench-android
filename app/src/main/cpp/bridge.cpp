@@ -13,6 +13,8 @@
 #include <ucontext.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <cstdint>
 #include "llama.h"
 #include "ggml-backend.h"
 #include "whisper.h"
@@ -39,7 +41,7 @@ static char g_model_hint[128] = {0};
 // SIGSEGV report says WHICH call was running (sample vs decode vs callback...).
 static const char * kOpNames[] = {
     "none", "prefill_decode", "sample", "accept", "to_piece",
-    "token_callback", "gen_decode", "state_save"
+    "jni_str", "jni_call", "jni_exc", "gen_decode", "state_save"
 };
 static const int kOpCount = (int) (sizeof(kOpNames) / sizeof(kOpNames[0]));
 static std::atomic<int> g_last_op{0};
@@ -47,49 +49,66 @@ static std::atomic<int> g_threads{0};
 static std::atomic<int> g_nctx{0};
 static std::atomic<int> g_prompt_tokens{0};
 static char g_backend_hint[24] = {0};
+static void * g_stack_lo = nullptr; // generation-thread stack range, for overflow flagging
+static size_t g_stack_size = 0;
 
 // forward decls: the maps helper below is defined before these helpers
 static void write_all(int fd, const char * s, size_t n);
 static void write_str(int fd, const char * s);
 static void write_long(int fd, long v);
+static void write_hex(int fd, unsigned long v);
 
-// Async-signal-safe-ish maps lookup: print "<lib path>+<offset>" for the
-// library containing addr. This makes the crash report symbolicable offline
-// against the exact unstripped .so kept as a CI artifact.
+// Async-signal-safe maps lookup: prints "<lib path>+0x<offset>" for the
+// library containing addr. Streams /proc/self/maps line by line: an Android
+// 16 app can produce far more maps text than the old fixed 32 KB buffer,
+// which silently truncated the tail (high-address libs like libart.so or
+// libllama.so were never found, so pc/lr printed "?" in 0.2.4).
+// No stdio, no malloc, no unbounded buffering.
 static void write_lib_for_addr(int fd, uintptr_t addr) {
-    static char maps_buf[32768];
     int fdm = open("/proc/self/maps", O_RDONLY);
     if (fdm < 0) { write_str(fd, "?"); return; }
-    size_t nread = 0;
-    while (nread < sizeof(maps_buf) - 1) {
-        ssize_t k = read(fdm, maps_buf + nread, sizeof(maps_buf) - 1 - nread);
-        if (k <= 0) break;
-        nread += (size_t) k;
-    }
-    close(fdm);
-    maps_buf[nread] = 0;
-    char * p = maps_buf;
-    while (p && *p) {
-        char * eol = strchr(p, '\n');
-        char * dash = strchr(p, '-');
-        if (dash && dash < (eol ? eol : p + nread)) {
-            uintptr_t lo = (uintptr_t) strtoul(p, nullptr, 16);
-            uintptr_t hi = (uintptr_t) strtoul(dash + 1, nullptr, 16);
+    char chunk[8192];
+    char line[512];
+    size_t llen = 0;
+    bool found = false;
+    unsigned long best_lo = 0;
+    char best_name[256] = {0};
+    ssize_t k;
+    while (!found && (k = read(fdm, chunk, sizeof(chunk))) > 0) {
+        for (ssize_t i = 0; i < k; ++i) {
+            char c = chunk[i];
+            if (c != '\n') {
+                if (llen < sizeof(line) - 1) line[llen++] = c;
+                continue;
+            }
+            line[llen] = 0;
+            llen = 0;
+            if (!line[0]) continue;
+            char * dash = strchr(line, '-');
+            if (!dash) continue;
+            unsigned long lo = strtoul(line, nullptr, 16);
+            unsigned long hi = strtoul(dash + 1, nullptr, 16);
             if (addr >= lo && addr < hi) {
-                char * slash = nullptr;
-                for (char * q = p; q < (eol ? eol : maps_buf + nread); ++q) if (*q == '/') slash = q;
+                char * slash = strchr(line, '/'); // first '/' starts the path field
                 if (slash) {
-                    size_t len = (size_t) ((eol ? eol : maps_buf + nread) - slash);
-                    write_all(fd, slash, len);
-                    write_str(fd, "+0x");
-                    write_long(fd, (long) (addr - lo));
-                } else { write_str(fd, "anon"); }
-                return;
+                    size_t plen = strlen(slash);
+                    if (plen > sizeof(best_name) - 1) plen = sizeof(best_name) - 1;
+                    memcpy(best_name, slash, plen);
+                    best_name[plen] = 0;
+                    best_lo = lo;
+                    found = true;
+                }
             }
         }
-        p = eol ? eol + 1 : nullptr;
     }
-    write_str(fd, "?");
+    close(fdm);
+    if (found) {
+        write_str(fd, best_name);
+        write_str(fd, "+0x");
+        write_hex(fd, addr - best_lo);
+    } else {
+        write_str(fd, "?");
+    }
 }
 
 // Async-signal-safe helpers: only open/write/close and manual int formatting.
@@ -103,6 +122,19 @@ static void write_long(int fd, long v) {
     if (u == 0) { write_str(fd, "0"); return; }
     while (u > 0 && i > 0) { b[--i] = (char) ('0' + (u % 10)); u /= 10; }
     if (v < 0 && i > 0) b[--i] = '-';
+    write_all(fd, b + i, sizeof(b) - (size_t) i);
+}
+// Hex formatter for addresses (async-signal-safe). The old report wrote
+// "0x" followed by write_long DECIMAL digits, so fault_addr=0x16777184 was
+// actually decimal 16777184 = 0xffffe0.
+static void write_hex(int fd, unsigned long v) {
+    char b[16]; int i = (int) sizeof(b);
+    if (v == 0) { write_str(fd, "0"); return; }
+    while (v > 0 && i > 0) {
+        int d = (int) (v & 0xF);
+        b[--i] = (char) (d < 10 ? '0' + d : 'a' + (d - 10));
+        v >>= 4;
+    }
     write_all(fd, b + i, sizeof(b) - (size_t) i);
 }
 
@@ -120,13 +152,33 @@ static void native_crash_handler(int sig, siginfo_t * info, void * uctx) {
             write_str(fd, "\nbackend="); write_str(fd, g_backend_hint);
             write_str(fd, "\nthreads="); write_long(fd, g_threads.load());
             write_str(fd, "\nctx="); write_long(fd, g_nctx.load());
-            write_str(fd, "\nfault_addr=0x"); write_long(fd, (long) (info ? info->si_addr : nullptr));
+            uintptr_t fa = (uintptr_t) (info ? info->si_addr : nullptr);
+            write_str(fd, "\nfault_addr=0x"); write_hex(fd, fa);
+            int stack_hit = 0;
+            if (g_stack_lo && g_stack_size) {
+                uintptr_t lo = (uintptr_t) g_stack_lo;
+                uintptr_t hi = lo + g_stack_size;
+                uintptr_t margin = (uintptr_t) (2UL << 20);
+                if (fa >= (lo > margin ? lo - margin : 0) && fa < hi) stack_hit = 1;
+            }
+            write_str(fd, "\nstack_hit="); write_long(fd, stack_hit);
 #ifdef __aarch64__
             ucontext_t * uc = (ucontext_t *) uctx;
             if (uc) {
-                write_str(fd, "\npc="); write_lib_for_addr(fd, (uintptr_t) uc->uc_mcontext.pc);
-                write_str(fd, "\nlr="); write_lib_for_addr(fd, (uintptr_t) uc->uc_mcontext.regs[30]);
-                write_str(fd, "\nsp=0x"); write_long(fd, (long) uc->uc_mcontext.sp);
+                uintptr_t pc = (uintptr_t) uc->uc_mcontext.pc;
+                uintptr_t lr = (uintptr_t) uc->uc_mcontext.regs[30];
+                // raw values FIRST (the maps walk below is the fragile part)
+                write_str(fd, "\npc=0x"); write_hex(fd, pc);
+                write_str(fd, "\nlr=0x"); write_hex(fd, lr);
+                write_str(fd, "\nsp=0x"); write_hex(fd, (uintptr_t) uc->uc_mcontext.sp);
+                write_str(fd, "\npc_lib="); write_lib_for_addr(fd, pc);
+                write_str(fd, "\nlr_lib="); write_lib_for_addr(fd, lr);
+                write_str(fd, "\nregs=");
+                for (int r = 0; r < 31; ++r) {
+                    write_str(fd, "x"); write_long(fd, r); write_str(fd, "=0x");
+                    write_hex(fd, (uintptr_t) uc->uc_mcontext.regs[r]);
+                    if (r != 30) write_str(fd, " ");
+                }
             }
 #endif
             write_str(fd, "\nmodel="); write_str(fd, g_model_hint);
@@ -172,6 +224,53 @@ static std::string cached_path;
 static int cached_gpu_layers = 0;
 static double last_load_ms = 0.0;
 
+// Convert standard UTF-8 into JNI "modified UTF-8" (CESU-8, NUL as C0 80,
+// 4-byte sequences as surrogate pairs) so NewStringUTF can never abort or
+// garble token text, whatever the model emits.
+static void append_modified_utf8(std::string & out, const char * s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char) s[i];
+        if (c < 0x80) {
+            if (c == 0) { out += (char) 0xC0; out += (char) 0x80; }
+            else out += (char) c;
+            i += 1;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < n) {
+            out += s[i]; out += s[i + 1]; i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < n) {
+            out += s[i]; out += s[i + 1]; out += s[i + 2]; i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < n) {
+            uint32_t cp = ((uint32_t) (c & 0x07) << 18) | ((uint32_t) (s[i+1] & 0x3F) << 12)
+                        | ((uint32_t) (s[i+2] & 0x3F) << 6) | (uint32_t) (s[i+3] & 0x3F);
+            i += 4;
+            if (cp >= 0x10000 && cp <= 0x10FFFF) {
+                uint32_t v = cp - 0x10000;
+                uint16_t pair[2] = { (uint16_t) (0xD800 + (v >> 10)), (uint16_t) (0xDC00 + (v & 0x3FF)) };
+                for (int q = 0; q < 2; ++q) {
+                    out += (char) (0xE0 | (pair[q] >> 12));
+                    out += (char) (0x80 | ((pair[q] >> 6) & 0x3F));
+                    out += (char) (0x80 | (pair[q] & 0x3F));
+                }
+            }
+        } else {
+            out += (char) 0xEF; out += (char) 0xBF; out += (char) 0xBD; // U+FFFD
+            i += 1;
+        }
+    }
+}
+
+// Remember the calling thread's stack range so the crash handler can flag
+// stack-overflow faults (SIGSEGV just below the stack base).
+static void capture_thread_stack() {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) return;
+    void * base = nullptr; size_t sz = 0;
+    if (pthread_attr_getstack(&attr, &base, &sz) == 0 && base && sz > 0) {
+        g_stack_lo = base; g_stack_size = sz;
+    }
+    pthread_attr_destroy(&attr);
+}
+
 static std::string from_java(JNIEnv * env, jstring value) {
     if (!value) return {};
     const char * raw = env->GetStringUTFChars(value, nullptr);
@@ -195,6 +294,7 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         JNIEnv * env, jobject, jstring path, jobjectArray roles, jobjectArray contents, jobject callback, jstring log_dir, jint threads_j) {
     stop_requested = false;
     g_gen_tokens.store(0);
+    capture_thread_stack();
     std::string model_path = from_java(env, path);
     {
         std::string logs = from_java(env, log_dir);
@@ -312,6 +412,12 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     int gen_tokens = 0;
     auto gen_start = std::chrono::steady_clock::now();
     set_phase(6); // generating
+    // Token text is buffered natively and flushed to the JVM in ~100 ms
+    // batches (or 96 bytes): ~20x fewer JNI crossings than per-token calls.
+    // Flushes never split a multi-byte sequence, and the text is converted
+    // to modified UTF-8 before NewStringUTF, so token content cannot abort it.
+    std::string pending;
+    double last_flush_ms = -1e9;
     for (int i = 0; ok && i < 512 && !stop_requested; ++i) {
         g_last_op.store(2); // sample
         llama_token token = llama_sampler_sample(sampler, ctx, -1);
@@ -322,19 +428,46 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         std::vector<char> piece(256);
         int len = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true);
         if (len < 0) { piece.resize(-len); len = llama_token_to_piece(vocab, token, piece.data(), piece.size(), 0, true); }
-        if (len > 0) {
-            std::string str(piece.data(), len);
-            g_last_op.store(5); // token_callback
-            jstring js = env->NewStringUTF(str.c_str());
-            if (js) { env->CallVoidMethod(callback, on_token, js); env->DeleteLocalRef(js); }
-            if (env->ExceptionCheck()) { stop_reason = "error"; break; }
-        }
-        llama_batch batch = llama_batch_get_one(&token, 1);
-        g_last_op.store(6); // gen_decode
-        if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
+        if (len > 0) pending.append(piece.data(), (size_t) len);
         ++gen_tokens;
         g_gen_tokens.store(gen_tokens);
-        if ((gen_tokens & 127) == 0) { g_last_op.store(7); save_phase_state(); } // refresh native_state.txt every 128 tokens
+        double now_ms = ms_since(gen_start);
+        // flush cut that never splits a multi-byte sequence
+        size_t cut = pending.size();
+        size_t j = cut; int back = 0;
+        while (back < 4 && j > 0 && ((unsigned char) pending[j-1] & 0xC0) == 0x80) { --j; ++back; }
+        if (j > 0) {
+            unsigned char lead = (unsigned char) pending[j-1];
+            size_t need = lead >= 0xF0 ? 4 : (lead >= 0xE0 ? 3 : (lead >= 0xC0 ? 2 : 1));
+            if (need > 1 && cut - (j - 1) < need) cut = j - 1;
+        } else cut = 0;
+        if (cut > 0 && (cut >= 96 || gen_tokens == 1 || now_ms - last_flush_ms >= 100.0)) {
+            std::string mu8;
+            append_modified_utf8(mu8, pending.data(), cut);
+            g_last_op.store(5); // jni_str
+            jstring js = env->NewStringUTF(mu8.c_str());
+            g_last_op.store(6); // jni_call
+            if (js) { env->CallVoidMethod(callback, on_token, js); env->DeleteLocalRef(js); }
+            g_last_op.store(7); // jni_exc
+            if (env->ExceptionCheck()) { stop_reason = "error"; break; }
+            pending.erase(0, cut);
+            last_flush_ms = now_ms;
+        }
+        llama_batch batch = llama_batch_get_one(&token, 1);
+        g_last_op.store(8); // gen_decode
+        if (llama_decode(ctx, batch) != 0) { ok = false; stop_reason = "context_full"; }
+        if ((gen_tokens & 127) == 0) { g_last_op.store(9); save_phase_state(); } // refresh native_state.txt every 128 tokens
+    }
+    if (!pending.empty() && !env->ExceptionCheck()) {
+        std::string mu8;
+        append_modified_utf8(mu8, pending.data(), pending.size());
+        g_last_op.store(5); // jni_str
+        jstring js = env->NewStringUTF(mu8.c_str());
+        g_last_op.store(6); // jni_call
+        if (js) { env->CallVoidMethod(callback, on_token, js); env->DeleteLocalRef(js); }
+        g_last_op.store(7); // jni_exc
+        env->ExceptionCheck(); // absorb status; final text must still reach the UI
+        pending.clear();
     }
     if (stop_requested) stop_reason = "user_stop";
     double gen_ms = ms_since(gen_start);
@@ -372,6 +505,7 @@ Java_com_pocketworkbench_app_NativeEngine_transcribe(JNIEnv * env, jobject, jstr
             if (!installed) { install_native_crash_handlers(); installed = true; }
         }
     }
+    capture_thread_stack();
     set_phase(1);
     whisper_context_params context_params = whisper_context_default_params();
     whisper_context * ctx = whisper_init_from_file_with_params(model_path.c_str(), context_params);
