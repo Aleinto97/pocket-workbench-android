@@ -21,6 +21,7 @@ import org.json.JSONObject
 import java.io.File
 
 class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
+    private val completedReasoning = Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE)
     private val store = PrivateStore(app)
     private val hub = HubClient()
     private val native = NativeEngine()
@@ -354,7 +355,12 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             when {
                 m.text.isBlank() -> {}
                 m.role == "tool" -> {} // display-only marker
-                m.role == "assistant" -> pre.add(m)
+                m.role == "assistant" -> {
+                    // Keep reasoning in the saved chat, but do not pay to prefill
+                    // it again on every later turn and every agent step.
+                    val answer = m.text.replace(completedReasoning, "").trim()
+                    if (answer.isNotEmpty()) pre.add(m.copy(text = answer))
+                }
                 else -> pre.add(m.copy(role = "user")) // user, tool_result, system from tools
             }
         }

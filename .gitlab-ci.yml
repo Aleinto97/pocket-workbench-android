@@ -52,7 +52,9 @@ build-apk:
     - 'if [ -n "$SYMDIR" ] && ls "$SYMDIR"/*.so >/dev/null 2>&1; then mkdir -p native-symbols && cp "$SYMDIR"/*.so native-symbols/ && tar czf native-symbols.tgz -C native-symbols . && ls -la native-symbols; else echo "WARN no unstripped native libs (SYMDIR=$SYMDIR)"; fi'
     # --- Pubblica APK nel registry dei pacchetti (URL di download stabile) ---
     - |
-      VERSION="0.2-${CI_COMMIT_SHORT_SHA}"
+      APP_VERSION=$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)"/\1/p' app/build.gradle.kts | head -1)
+      test -n "$APP_VERSION"
+      VERSION="${APP_VERSION}-${CI_COMMIT_SHORT_SHA}"
       curl --request PUT --silent --show-error --fail \
         --header "JOB-TOKEN: $CI_JOB_TOKEN" \
         --upload-file "PocketWorkbench-debug.apk" \
