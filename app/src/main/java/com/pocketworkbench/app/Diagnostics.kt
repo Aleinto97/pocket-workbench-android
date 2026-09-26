@@ -90,6 +90,13 @@ object Diag {
                 val body = nativeCrash.readText().trim()
                 if (body.isNotBlank()) {
                     lastCrashReport = "NATIVE SIGNAL\n" + body.lines().joinToString("\n")
+                    // v0.2.10: after a native crash on the Vulkan path, drop the
+                    // vk_safe_mode marker so the next native run applies the
+                    // conservative Adreno feature set (see bridge.cpp).
+                    val crashBackend = body.lineSequence().firstOrNull { it.startsWith("backend=") }?.removePrefix("backend=")?.trim()
+                    if (crashBackend == "vulkan") {
+                        try { File(logsDir, "vk_safe_mode").writeText("1") } catch (_: Exception) {}
+                    }
                 }
                 nativeCrash.copyTo(File(logsDir, "native_crash_seen.txt"), overwrite = true)
             } catch (_: Exception) {}

@@ -92,6 +92,11 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     fun applyGpu(enabled: Boolean) {
         if (busy) return
         useGpu = enabled
+        if (enabled) {
+            // user explicitly re-armed the GPU: clear the post-crash safe mode
+            try { File(logDir, "vk_safe_mode").delete() } catch (_: Exception) {}
+            Diag.log("config", "vulkan safe mode cleared by user")
+        }
         config.edit().putBoolean("use_gpu", enabled).apply()
         Diag.log("config", "gpu_requested=$enabled")
     }
@@ -123,6 +128,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         activeId = conversations.first().id
         refresh()
         Diag.log("vm", "init: ${conversations.size} chats, ${installed.size} models, agent=$agentMode, app=${Diag.appVersion()}")
+        if (File(logDir, "vk_safe_mode").exists()) Diag.log("config", "vulkan safe mode active: conservative Adreno feature set applied by native")
         gh.token()?.let {
             viewModelScope.launch {
                 try {
@@ -403,7 +409,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         val replyIndex = chat.messages.size - 1
         val (roles, texts) = withContext(Dispatchers.Main) { modelSnapshot(chatId, replyIndex, includeSystem = false) }
         val buffer = StringBuilder()
-        Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads ctx=$contextTokens gpu=$useGpu replyIndex=$replyIndex")
+        Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""} replyIndex=$replyIndex")
         native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
             override fun onToken(piece: String) {
                 if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
@@ -433,7 +439,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             val buffer = StringBuilder()
             val stepReplyIndex = replyIndex
             withContext(Dispatchers.Main) { status = if (step == 0) "Agent: thinking…" else "Agent: step ${step + 1}" }
-            Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size} ctx=$contextTokens gpu=$useGpu")
+            Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size} ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""}")
             native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
                 override fun onToken(piece: String) {
                     if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }

@@ -305,6 +305,26 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
             snprintf(g_state_file, sizeof(g_state_file), "%s/native_state.txt", logs.c_str());
             static bool handlers_installed = false;
             if (!handlers_installed) { install_native_crash_handlers(); handlers_installed = true; }
+            // Adreno Vulkan hardening (v0.2.10). The 0.2.9 crash was a SIGSEGV
+            // inside the closed-source Qualcomm driver (vulkan.adreno.so,
+            // vk::Queue::submit, NULL argument) during llama.cpp's concurrent
+            // submissions. Submissions are serialized from the first run; if a
+            // Vulkan crash ever occurs, the JVM drops a vk_safe_mode marker and
+            // the full conservative feature set is applied (no F16/coopmat/
+            // multi-add, capped submission size). ggml-vulkan reads these env
+            // vars once at first device init, so setting them here — before
+            // any llama_/ggml_ call of the process — is early enough.
+            setenv("GGML_VK_SERIALIZE_SUBMISSIONS", "1", 0);
+            std::string safe_path = logs + "/vk_safe_mode";
+            if (FILE * sf = fopen(safe_path.c_str(), "r")) {
+                fclose(sf);
+                setenv("GGML_VK_DISABLE_F16", "1", 0);
+                setenv("GGML_VK_DISABLE_COOPMAT", "1", 0);
+                setenv("GGML_VK_DISABLE_COOPMAT2", "1", 0);
+                setenv("GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR", "1", 0);
+                setenv("GGML_VK_DISABLE_MULTI_ADD", "1", 0);
+                setenv("GGML_VK_MAX_NODES_PER_SUBMIT", "48", 0);
+            }
         }
     }
     const char * base = strrchr(model_path.c_str(), '/');
