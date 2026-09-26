@@ -19,6 +19,9 @@ build-apk:
     - apt-get update -qq && apt-get install -y -qq software-properties-common >/dev/null
     - add-apt-repository -y universe >/dev/null
     - apt-get update -qq && apt-get install -y -qq curl unzip git build-essential glslc libvulkan-dev spirv-headers >/dev/null
+    # The Android NDK toolchain hides host CMake packages from find_package().
+    - 'export SPIRV_HEADERS_CMAKE_DIR=$(dirname "$(dpkg -L spirv-headers | grep "/SPIRV-HeadersConfig.cmake$" | head -1)")'
+    - 'test -f "$SPIRV_HEADERS_CMAKE_DIR/SPIRV-HeadersConfig.cmake"'
     # --- Android SDK cmdline-tools ---
     - mkdir -p "$ANDROID_HOME/cmdline-tools"
     - curl -sSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"

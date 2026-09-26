@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "com.pocketworkbench.app"
     compileSdk = 35
+    ndkVersion = "27.2.12479018"
     defaultConfig {
         applicationId = "com.pocketworkbench.app"
         minSdk = 29
@@ -13,7 +14,11 @@ android {
         versionCode = 8
         versionName = "0.2.7"
         ndk { abiFilters += "arm64-v8a" }
-        externalNativeBuild { cmake { cppFlags += "-std=c++17"; arguments += listOf("-DGGML_NATIVE=OFF", "-DGGML_OPENMP=OFF", "-DGGML_LLAMAFILE=OFF", "-DLLAMA_OPENSSL=OFF", "-DGGML_VULKAN=${if (providers.gradleProperty("gpu").orNull == "true") "ON" else "OFF"}") } }
+        externalNativeBuild { cmake {
+            cppFlags += "-std=c++17"
+            arguments += listOf("-DGGML_NATIVE=OFF", "-DGGML_OPENMP=OFF", "-DGGML_LLAMAFILE=OFF", "-DLLAMA_OPENSSL=OFF", "-DGGML_VULKAN=${if (providers.gradleProperty("gpu").orNull == "true") "ON" else "OFF"}")
+            providers.environmentVariable("SPIRV_HEADERS_CMAKE_DIR").orNull?.let { arguments += "-DSPIRV-Headers_DIR=$it" }
+        } }
     }
     buildFeatures { compose = true }
     // Stable signing key committed in the private repo: every CI build is signed
