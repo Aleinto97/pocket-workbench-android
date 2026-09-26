@@ -59,8 +59,23 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         config.edit().putInt("gen_threads", genThreads).apply()
         Diag.log("config", "gen_threads=$genThreads")
     }
+    var contextTokens by androidx.compose.runtime.mutableStateOf(config.getInt("context_tokens", 8192).coerceIn(4096, 16384)); private set
+    var useGpu by androidx.compose.runtime.mutableStateOf(config.getBoolean("use_gpu", true)); private set
+    fun applyContextTokens(n: Int) {
+        if (busy) return
+        contextTokens = when (n) { 4096, 8192, 16384 -> n; else -> 8192 }
+        config.edit().putInt("context_tokens", contextTokens).apply()
+        Diag.log("config", "context_tokens=$contextTokens")
+    }
+    fun applyGpu(enabled: Boolean) {
+        if (busy) return
+        useGpu = enabled
+        config.edit().putBoolean("use_gpu", enabled).apply()
+        Diag.log("config", "gpu_requested=$enabled")
+    }
 
     private var generation: Job? = null
+    @Volatile private var stopRequested = false
     private var ghJob: Job? = null
     private var recording: Job? = null
     private var recorder: AudioRecord? = null
@@ -232,8 +247,9 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         if (i >= 0) conversations[i] = transform(conversations[i])
     }
     private fun streamAbsolute(chatId: String, replyIndex: Int, buffer: StringBuilder) {
+        val snapshot = buffer.toString() // the native callback owns the mutable buffer
         viewModelScope.launch(Dispatchers.Main) {
-            flushBuffer(chatId, replyIndex, buffer)
+            flushBuffer(chatId, replyIndex, snapshot)
         }
     }
     // Throttled streaming: per-token Main-thread updates used to storm the UI
@@ -244,11 +260,11 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         lastUiFlushMs = now
         streamAbsolute(chatId, replyIndex, buffer)
     }
-    private fun flushBuffer(chatId: String, replyIndex: Int, buffer: StringBuilder) {
+    private fun flushBuffer(chatId: String, replyIndex: Int, content: String) {
         updateChat(chatId) { chat ->
             if (chat.messages.size > replyIndex) {
                 val messages = chat.messages.toMutableList()
-                messages[replyIndex] = messages[replyIndex].copy(text = buffer.toString())
+                messages[replyIndex] = messages[replyIndex].copy(text = content)
                 chat.copy(messages = messages)
             } else chat
         }
@@ -262,10 +278,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             } else chat
         }
     }
-    private fun addMessage(chatId: String, message: ChatMessage) {
-        // Synchronous mutation on the (thread-safe) snapshot list so agent-loop
-        // steps that follow immediately can read the message.
-        updateChatBlocking(chatId) { chat -> chat.copy(messages = chat.messages.toMutableList().apply { add(message) }) }
+    private suspend fun addMessage(chatId: String, message: ChatMessage) = withContext(Dispatchers.Main) {
+        updateChat(chatId) { chat -> chat.copy(messages = chat.messages.toMutableList().apply { add(message) }) }
     }
 
     // ---------- Chat: generation ----------
@@ -287,6 +301,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         Diag.log("chat", "send: model=${model.name} chars=${text.trim().length} agent=$useAgent replyIndex=$replyIndex")
         Diag.updateState("generating", "model=${model.name}")
         busy = true; toolStatus = ""
+        stopRequested = false
         status = if (useAgent) "Agent: thinking…" else "Generating locally…"
         generation = viewModelScope.launch(Dispatchers.IO) {
             val heartbeat = startHeartbeat(model.name)
@@ -330,8 +345,12 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 else -> pre.add(m.copy(role = "user")) // user, tool_result, system from tools
             }
         }
-        val window = pre.drop(if (includeSystem) 1 else 0).takeLast(19)
-        val final = if (includeSystem) listOf(pre.first()) + window else window
+        val history = pre.drop(if (includeSystem) 1 else 0)
+        val window = history.takeLast(40)
+        val initialRequest = if (includeSystem) history.firstOrNull { it.role == "user" } else null
+        val final = if (includeSystem) {
+            listOf(pre.first()) + (if (initialRequest != null && !window.contains(initialRequest)) listOf(initialRequest) else emptyList()) + window
+        } else window
         return final.map { it.role }.toTypedArray() to final.map { it.text }.toTypedArray()
     }
 
@@ -347,9 +366,9 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private suspend fun runLocalTurn(chatId: String, model: LocalModel) {
         val chat = conversations.find { it.id == chatId } ?: return
         val replyIndex = chat.messages.size - 1
-        val (roles, texts) = modelSnapshot(chatId, replyIndex, includeSystem = false)
+        val (roles, texts) = withContext(Dispatchers.Main) { modelSnapshot(chatId, replyIndex, includeSystem = false) }
         val buffer = StringBuilder()
-        Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads replyIndex=$replyIndex")
+        Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads ctx=$contextTokens gpu=$useGpu replyIndex=$replyIndex")
         native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
             override fun onToken(piece: String) {
                 if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
@@ -362,8 +381,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                 entry?.let { viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, it.chip()) } }
             }
-        }, logDir, genThreads)
-        flushBuffer(chatId, replyIndex, buffer) // guarantee final text shows despite throttling
+        }, logDir, genThreads, contextTokens, useGpu)
+        withContext(Dispatchers.Main) { flushBuffer(chatId, replyIndex, buffer.toString()) }
         persist()
         Diag.log("gen", "local turn done: tokens=${if (nativeGenTokens > 0) nativeGenTokens else tokenCount} (chunks=$tokenCount) ttft=${firstTokenMs}ms chars=${buffer.length}")
         withContext(Dispatchers.Main) { status = "Ready" }
@@ -373,31 +392,35 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         val chat = conversations.find { it.id == chatId } ?: return
         var replyIndex = chat.messages.size - 1
         var lastEntry: PerfEntry? = null
-        for (step in 0 until 6) {
-            val (roles, texts) = modelSnapshot(chatId, replyIndex, includeSystem = true)
+        for (step in 0 until 12) {
+            if (stopRequested) break
+            val (roles, texts) = withContext(Dispatchers.Main) { modelSnapshot(chatId, replyIndex, includeSystem = true) }
             val buffer = StringBuilder()
+            val stepReplyIndex = replyIndex
             withContext(Dispatchers.Main) { status = if (step == 0) "Agent: thinking…" else "Agent: step ${step + 1}" }
-            Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size}")
+            Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size} ctx=$contextTokens gpu=$useGpu")
             native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
                 override fun onToken(piece: String) {
                     if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
                     buffer.append(piece); tokenCount++
-                    streamThrottled(chatId, replyIndex, buffer)
+                    streamThrottled(chatId, stepReplyIndex, buffer)
                 }
                 override fun onStats(json: String) {
                     nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
                     Diag.log("stats", "step $step received: $json")
                     val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
-                    if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, replyIndex, entry.chip()) } }
+                    if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { attachPerf(chatId, stepReplyIndex, entry.chip()) } }
                 }
-            }, logDir, genThreads)
-            flushBuffer(chatId, replyIndex, buffer) // full step text in UI before parse/replace
+            }, logDir, genThreads, contextTokens, useGpu)
+            withContext(Dispatchers.Main) { flushBuffer(chatId, stepReplyIndex, buffer.toString()) }
+            if (stopRequested) break
             val parsed = McpTools.parse(buffer.toString())
             if (parsed.call == null) {
                 if (parsed.attempted) {
                     Diag.log("agent", "step $step: malformed tool call, retrying with correction prompt")
                     addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT] error: malformed tool call. Use <tool>{\"name\":\"…\",\"arguments\":{…}}</tool> or answer in plain text."))
-                    updateChatBlocking(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", "")) }) }
+                    val message = if (step == 11) "Reached the 12-step limit. Send 'continue' to retry the tool call." else ""
+                    withContext(Dispatchers.Main) { updateChat(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", message)) }) } }
                     replyIndex = (conversations.find { it.id == chatId }?.messages?.size ?: 1) - 1
                     continue
                 }
@@ -418,25 +441,23 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 toolStatus = "Running ${call.name}…"
                 status = "Agent: ${call.name}"
             }
+            if (stopRequested) break
             val result = McpTools.execute(call, gh)
             Diag.log("agent", "step $step: tool ${call.name} result: ${result.take(160).replace('\n', ' ')}")
             addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT name=${call.name}]\n$result"))
-            updateChatBlocking(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", "")) }) }
+            if (stopRequested) break
+            val finalStep = step == 11
+            val nextText = if (finalStep) "Reached the 12-step limit. Send 'continue' to carry on from these results." else ""
+            withContext(Dispatchers.Main) { updateChat(chatId) { it.copy(messages = it.messages.toMutableList().apply { add(ChatMessage("assistant", nextText)) }) } }
             replyIndex = (conversations.find { it.id == chatId }?.messages?.size ?: 1) - 1
         }
         lastEntry?.let { entry -> withContext(Dispatchers.Main) { attachPerf(chatId, replyIndex, entry.chip()) } }
         withContext(Dispatchers.Main) { status = "Ready"; toolStatus = "" }
     }
 
-    // Synchronous append used inside the agent loop (IO thread) so the next
-    // generation sees the placeholder message even before Main dispatches.
-    private fun updateChatBlocking(chatId: String, transform: (Conversation) -> Conversation) {
-        val i = conversations.indexOfFirst { it.id == chatId }
-        if (i >= 0) conversations[i] = transform(conversations[i])
-    }
-
     fun stop() {
         Diag.log("gen", "user requested stop at chunks=$tokenCount (ttft=${firstTokenMs}ms)")
+        stopRequested = true
         native.stop(); status = "Stopping…"
     }
 

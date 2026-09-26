@@ -222,6 +222,7 @@ static void set_phase(int p) { g_phase.store(p); save_phase_state(); }
 static llama_model * cached_model = nullptr;
 static std::string cached_path;
 static int cached_gpu_layers = 0;
+static int cached_gpu_requested = 0;
 static double last_load_ms = 0.0;
 
 // Convert standard UTF-8 into JNI "modified UTF-8" (CESU-8, NUL as C0 80,
@@ -291,7 +292,8 @@ Java_com_pocketworkbench_app_NativeEngine_stop(JNIEnv *, jobject) { stop_request
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_pocketworkbench_app_NativeEngine_generate(
-        JNIEnv * env, jobject, jstring path, jobjectArray roles, jobjectArray contents, jobject callback, jstring log_dir, jint threads_j) {
+        JNIEnv * env, jobject, jstring path, jobjectArray roles, jobjectArray contents, jobject callback, jstring log_dir,
+        jint threads_j, jint context_j, jboolean use_gpu_j) {
     stop_requested = false;
     g_gen_tokens.store(0);
     capture_thread_stack();
@@ -309,14 +311,16 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     snprintf(g_model_hint, sizeof(g_model_hint), "%s", base ? base + 1 : model_path.c_str());
     set_phase(1); // load_model
     ggml_backend_load_all();
-    const bool gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) || ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
-    int gpu_layers = gpu ? 99 : 0;
+    const bool gpu = use_gpu_j && (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) || ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU));
+    const int requested_gpu_layers = gpu ? 99 : 0;
+    int gpu_layers = requested_gpu_layers;
     bool loaded_now = false;
-    bool gpu_fallback = false;
+    bool gpu_fallback = use_gpu_j && !gpu;
     llama_model * model = nullptr;
-    if (cached_model && cached_path == model_path) {
+    if (cached_model && cached_path == model_path && cached_gpu_requested == requested_gpu_layers) {
         model = cached_model;
         gpu_layers = cached_gpu_layers;
+        gpu_fallback = use_gpu_j && gpu_layers == 0;
     } else {
         if (cached_model) { llama_model_free(cached_model); cached_model = nullptr; cached_path.clear(); }
         auto load_start = std::chrono::steady_clock::now();
@@ -325,13 +329,13 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         model = llama_model_load_from_file(model_path.c_str(), mp);
         if (!model && gpu) { mp.n_gpu_layers = 0; gpu_layers = 0; gpu_fallback = true; model = llama_model_load_from_file(model_path.c_str(), mp); }
         if (!model) { set_phase(10); fail(env, "Cannot load GGUF model. Check format and free memory."); return; }
-        cached_model = model; cached_path = model_path; cached_gpu_layers = gpu_layers;
+        cached_model = model; cached_path = model_path; cached_gpu_layers = gpu_layers; cached_gpu_requested = requested_gpu_layers;
         loaded_now = true;
         last_load_ms = ms_since(load_start);
     }
     set_phase(2); // alloc_context
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 4096;
+    cp.n_ctx = std::clamp((int) context_j, 4096, 16384);
     cp.n_batch = 512;
     // llama.cpp issue #28878: SIGSEGV in the CPU compute path on Android/aarch64
     // with 6+ threads (thread-count-dependent race, not content-dependent).
@@ -351,7 +355,7 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         model = llama_model_load_from_file(model_path.c_str(), mp);
         gpu_layers = 0; gpu_fallback = true; loaded_now = true;
         last_load_ms = ms_since(load_start);
-        if (model) { cached_model = model; cached_path = model_path; cached_gpu_layers = 0; ctx = llama_init_from_model(model, cp); }
+        if (model) { cached_model = model; cached_path = model_path; cached_gpu_layers = 0; cached_gpu_requested = requested_gpu_layers; ctx = llama_init_from_model(model, cp); }
     }
     if (!ctx) { set_phase(10); fail(env, "Cannot allocate model context."); return; }
 
@@ -360,7 +364,7 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
     jmethodID on_stats = env->GetMethodID(callback_type, "onStats", "(Ljava/lang/String;)V");
     bool ok = on_token != nullptr;
     std::string backend = gpu_layers > 0 ? "Vulkan GPU" : "CPU";
-    if (gpu_fallback) backend = "CPU (GPU load failed, fallback)";
+    if (gpu_fallback) backend = gpu ? "CPU (GPU failed)" : "CPU (GPU unavailable)";
     snprintf(g_backend_hint, sizeof(g_backend_hint), "%s",
              gpu_layers > 0 ? "vulkan" : (gpu_fallback ? "cpu-fb" : "cpu"));
 
@@ -374,25 +378,40 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         r.push_back(from_java(env, jr)); c.push_back(from_java(env, jc));
         env->DeleteLocalRef(jr); env->DeleteLocalRef(jc);
     }
-    for (size_t i = 0; i < r.size(); ++i) messages.push_back({r[i].c_str(), c[i].c_str()});
+    std::vector<size_t> kept;
+    for (size_t i = 0; i < r.size(); ++i) kept.push_back(i);
     set_phase(3); // chat_template
     const char * tmpl = llama_model_chat_template(model, nullptr);
-    int required = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
-    if (required <= 0 || required > 4 * 1024 * 1024) {
-        llama_free(ctx); fail(env, "Model chat template is unavailable."); return;
+    int n = 0;
+    std::vector<llama_token> tokens;
+    // Reserve at least 1024 positions for an answer. Drop old turns by exact
+    // tokenizer count, retaining the system instruction, initial request and
+    // latest message. UI history is untouched; only this inference view shrinks.
+    for (;;) {
+        messages.clear();
+        for (size_t i : kept) messages.push_back({r[i].c_str(), c[i].c_str()});
+        int required = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, nullptr, 0);
+        if (required <= 0 || required > 4 * 1024 * 1024) {
+            llama_free(ctx); fail(env, "Model chat template is unavailable or too large."); return;
+        }
+        std::string prompt(required + 1, '\0');
+        llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, prompt.data(), prompt.size());
+        prompt.resize(required);
+        set_phase(4); // tokenize
+        n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
+        if (n >= 0) { llama_free(ctx); fail(env, "Tokenization failed."); return; }
+        tokens.resize(-n);
+        n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens.data(), tokens.size(), true, true);
+        if (n <= 0) { llama_free(ctx); fail(env, "Tokenization failed."); return; }
+        tokens.resize(n);
+        if (n <= (int) cp.n_ctx - 1024) break;
+        size_t oldest = (!kept.empty() && r[kept[0]] == "system") ? 2 : 1;
+        if (kept.size() <= oldest + 1) {
+            llama_free(ctx); fail(env, "Latest request exceeds the context window. Select a larger window or shorten the message."); return;
+        }
+        kept.erase(kept.begin() + oldest);
     }
-    std::string prompt(required + 1, '\0');
-    llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, prompt.data(), prompt.size());
-    prompt.resize(required);
-    set_phase(4); // tokenize
-    int n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
-    if (n >= 0) { llama_free(ctx); fail(env, "Tokenization failed."); return; }
-    std::vector<llama_token> tokens(-n);
-    n = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens.data(), tokens.size(), true, true);
-    if (n <= 0 || n >= 3500) {
-        llama_free(ctx); fail(env, "Conversation is too long for the 4096-token context."); return;
-    }
-    tokens.resize(n);
+    const int dropped_messages = (int) r.size() - (int) kept.size();
     llama_sampler_chain_params sp = llama_sampler_chain_default_params();
     llama_sampler * sampler = llama_sampler_chain_init(sp);
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(0.7f));
@@ -483,9 +502,9 @@ Java_com_pocketworkbench_app_NativeEngine_generate(
         char buf[512];
         snprintf(buf, sizeof(buf),
             "{\"backend\":\"%s\",\"threads\":%d,\"ctx\":%d,\"load_ms\":%.1f,\"model_cached\":%d,\"gpu_fallback\":%d,"
-            "\"prefill_tokens\":%d,\"prefill_ms\":%.1f,\"gen_tokens\":%d,\"gen_ms\":%.1f,\"stop\":\"%s\"}",
+            "\"prefill_tokens\":%d,\"prefill_ms\":%.1f,\"gen_tokens\":%d,\"gen_ms\":%.1f,\"history_dropped\":%d,\"stop\":\"%s\"}",
             backend.c_str(), cp.n_threads, (int) cp.n_ctx, loaded_now ? last_load_ms : 0.0,
-            loaded_now ? 0 : 1, gpu_fallback ? 1 : 0, n, prefill_ms, gen_tokens, gen_ms, stop_reason.c_str());
+            loaded_now ? 0 : 1, gpu_fallback ? 1 : 0, n, prefill_ms, gen_tokens, gen_ms, dropped_messages, stop_reason.c_str());
         jstring js = env->NewStringUTF(buf);
         set_phase(8); // stats_callback — if the process dies here, Diag will show 'stats_callback'
         if (js) { env->CallVoidMethod(callback, on_stats, js); env->DeleteLocalRef(js); }

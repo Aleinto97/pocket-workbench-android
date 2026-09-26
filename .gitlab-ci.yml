@@ -16,7 +16,7 @@ build-apk:
       - .gradle-home/caches
       - .gradle-home/wrapper
   script:
-    - apt-get update -qq && apt-get install -y -qq curl unzip git >/dev/null
+    - apt-get update -qq && apt-get install -y -qq curl unzip git glslc libvulkan-dev spirv-headers >/dev/null
     # --- Android SDK cmdline-tools ---
     - mkdir -p "$ANDROID_HOME/cmdline-tools"
     - curl -sSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
@@ -32,7 +32,7 @@ build-apk:
     # --- Native deps (llama.cpp / whisper.cpp) ---
     - bash scripts/fetch-native.sh
     # --- Build APK debug ---
-    - gradle :app:assembleDebug --no-daemon --stacktrace
+    - gradle :app:assembleDebug -Pgpu=true --no-daemon --stacktrace
     - APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
     - cp "$APK" PocketWorkbench-debug.apk
     - ls -la PocketWorkbench-debug.apk

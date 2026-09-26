@@ -242,6 +242,19 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                         FilterChip(selected = vm.genThreads == n, onClick = { vm.applyGenThreads(n) }, label = { Text("$n") })
                     }
                 }
+                Text("Inference backend", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = vm.useGpu, onClick = { vm.applyGpu(true) }, enabled = !vm.busy, label = { Text("GPU (Vulkan, CPU fallback)") })
+                    FilterChip(selected = !vm.useGpu, onClick = { vm.applyGpu(false) }, enabled = !vm.busy, label = { Text("CPU") })
+                }
+                Text("Actual backend and fallback are shown in Stats after each reply.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                Text("Context window: ${vm.contextTokens} tokens", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(4096, 8192, 16384).forEach { n ->
+                        FilterChip(selected = vm.contextTokens == n, onClick = { vm.applyContextTokens(n) }, enabled = !vm.busy, label = { Text("${n / 1024}K") })
+                    }
+                }
+                Text("Larger windows need more memory and increase prompt processing time.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
             }
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
