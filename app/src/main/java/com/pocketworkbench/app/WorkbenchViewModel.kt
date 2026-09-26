@@ -146,14 +146,6 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     /** GPU is used only when the user asked for it and no crash marker is set. */
     private fun effectiveGpu(): Boolean = useGpu && !File(logDir, "gpu_safe_mode").exists()
 
-    init {
-        if (gpuDefaultMigrated && useGpu && File(logDir, "gpu_safe_mode").exists()) {
-            useGpu = false
-            config.edit().putBoolean("use_gpu", false).apply()
-            Diag.log("config", "gpu safe mode active after a native GPU crash: OpenCL disabled")
-        }
-    }
-
     private fun engineFailure(model: LocalModel, buffer: StringBuilder, t: Throwable) {
         val msg = t.message ?: t.toString()
         lastEngineError = msg
@@ -176,6 +168,13 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
 
     // ---------- Diagnostics: shared generation tracking ----------
     private val logDir: String by lazy { File(getApplication<Application>().filesDir, "logs").apply { mkdirs() }.absolutePath }
+    init {
+        if (gpuDefaultMigrated && useGpu && File(logDir, "gpu_safe_mode").exists()) {
+            useGpu = false
+            config.edit().putBoolean("use_gpu", false).apply()
+            Diag.log("config", "gpu safe mode active after a native GPU crash: OpenCL disabled")
+        }
+    }
     private var genStartMs = 0L
     private var firstTokenMs = 0L
     private var tokenCount = 0        // counts JNI batches received (v0.2.5+ batches ~100ms of text each)

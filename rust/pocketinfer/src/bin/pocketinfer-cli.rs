@@ -76,6 +76,29 @@ fn main() {
             }
             let _ = k;
         }
+        "gpu" => {
+            match engine.enable_opencl() {
+                Ok(()) => println!("opencl_enabled=ok"),
+                Err(e) => println!("opencl_enabled=FAILED: {e}"),
+            }
+            let text = args.get(3).cloned().unwrap_or_else(|| "The capital of France is".into());
+            let ids = engine.model.tok.encode(&text, true);
+            eprintln!("ids={ids:?}");
+            let opts = GenOpts {
+                n_ctx: 512,
+                max_tokens: args.get(4).and_then(|v| v.parse().ok()).unwrap_or(8),
+                temp: 0.0,
+                top_p: 1.0,
+                seed: 1,
+                threads,
+            };
+            let stats = engine.generate(&ids, &opts, |b| {
+                print!("{}", String::from_utf8_lossy(b));
+                true
+            }).unwrap();
+            println!();
+            eprintln!("ids_out={:?}", stats.gen_ids);
+        }
         "dumpids" => {
             let ids: Vec<u32> = args
                 .get(3)
