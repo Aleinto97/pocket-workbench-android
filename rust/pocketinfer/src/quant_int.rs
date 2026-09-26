@@ -245,3 +245,170 @@ mod dp {
         }
     }
 }
+
+pub fn dot_row_q8_lanes(ttype: u32, row: &[u8], k: usize, act: &Q8Act, out: &mut [f32], b: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        match ttype {
+            GGML_TYPE_Q4_0 => return lanes::q4_0_lanes(row, k, act, out, b),
+            GGML_TYPE_Q8_0 => return lanes::q8_0_lanes(row, k, act, out, b),
+            GGML_TYPE_Q4_K => return lanes::q4_k_lanes(row, k, act, out, b),
+            GGML_TYPE_Q6_K => return lanes::q6_k_lanes(row, k, act, out, b),
+            _ => {}
+        }
+    }
+    for lane in 0..b {
+        out[lane] += dot_row_q8(ttype, row, k, act, lane);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod lanes {
+    use super::*;
+    use core::arch::aarch64::*;
+
+    #[inline]
+    unsafe fn hsum(v: int32x4_t) -> f32 {
+        vaddvq_s32(v) as f32
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q8_0_lanes(w: &[u8], k: usize, act: &Q8Act, out: &mut [f32], b: usize) {
+        let nb = k / 32;
+        let mut acc = [0f32; 64];
+        for blk in 0..nb {
+            let base = blk * 34;
+            let d = crate::util::f16_to_f32(u16::from_le_bytes([w[base], w[base + 1]]));
+            let qw = w.as_ptr().add(base + 2) as *const i8;
+            let w0 = vld1q_s8(qw);
+            let w1 = vld1q_s8(qw.add(16));
+            for lane in 0..b {
+                let a = act.qblock(lane, blk).as_ptr();
+                let mut s = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(a));
+                s = vdotq_s32(s, w1, vld1q_s8(a.add(16)));
+                acc[lane] += d * act.d[lane * nb + blk] * hsum(s);
+            }
+        }
+        for lane in 0..b {
+            out[lane] += acc[lane];
+        }
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q4_0_lanes(w: &[u8], k: usize, act: &Q8Act, out: &mut [f32], b: usize) {
+        let nb = k / 32;
+        let mut acc = [0f32; 64];
+        let mut we = [0i8; 32];
+        for blk in 0..nb {
+            let base = blk * 18;
+            let d = crate::util::f16_to_f32(u16::from_le_bytes([w[base], w[base + 1]]));
+            let v = vld1q_u8(w.as_ptr().add(base + 2));
+            vst1q_s8(we.as_mut_ptr(), vreinterpretq_s8_u8(vandq_u8(v, vdupq_n_u8(0x0F))));
+            vst1q_s8(we.as_mut_ptr().add(16), vreinterpretq_s8_u8(vshrq_n_u8(v, 4)));
+            let w0 = vld1q_s8(we.as_ptr());
+            let w1 = vld1q_s8(we.as_ptr().add(16));
+            for lane in 0..b {
+                let a = act.qblock(lane, blk).as_ptr();
+                let mut s = vdotq_s32(vdupq_n_s32(0), w0, vld1q_s8(a));
+                s = vdotq_s32(s, w1, vld1q_s8(a.add(16)));
+                let dq = act.d[lane * nb + blk];
+                let sq = act.sum[lane * nb + blk];
+                acc[lane] += d * dq * (hsum(s) - 8.0 * sq as f32);
+            }
+        }
+        for lane in 0..b {
+            out[lane] += acc[lane];
+        }
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q4_k_lanes(w: &[u8], k: usize, act: &Q8Act, out: &mut [f32], b: usize) {
+        let nb = k / 256;
+        let mut acc = [0f32; 64];
+        let mut we = [0i8; 256];
+        for blk in 0..nb {
+            let base = blk * 144;
+            let d = crate::util::f16_to_f32(u16::from_le_bytes([w[base], w[base + 1]]));
+            let dmin = crate::util::f16_to_f32(u16::from_le_bytes([w[base + 2], w[base + 3]]));
+            let scales = &w[base + 4..base + 16];
+            for g in 0..4 {
+                let q = w.as_ptr().add(base + 16 + g * 32);
+                for h in 0..2 {
+                    let v = vld1q_u8(q.add(h * 16));
+                    vst1q_s8(
+                        we.as_mut_ptr().add(2 * g * 32 + h * 16),
+                        vreinterpretq_s8_u8(vandq_u8(v, vdupq_n_u8(0x0F))),
+                    );
+                    vst1q_s8(
+                        we.as_mut_ptr().add((2 * g + 1) * 32 + h * 16),
+                        vreinterpretq_s8_u8(vshrq_n_u8(v, 4)),
+                    );
+                }
+            }
+            for lane in 0..b {
+                let abl = lane * act.nb + blk * 8;
+                for sb in 0..8 {
+                    let (s, m) = super::dp::get_scale_min_k4_pub(sb, scales);
+                    let a = act.q.as_ptr().add(lane * act.k + blk * 256 + sb * 32);
+                    let wa = we.as_ptr().add(sb * 32);
+                    let mut qd = vdotq_s32(vdupq_n_s32(0), vld1q_s8(wa), vld1q_s8(a));
+                    qd = vdotq_s32(qd, vld1q_s8(wa.add(16)), vld1q_s8(a.add(16)));
+                    let da = act.d[abl + sb];
+                    let sa = act.sum[abl + sb];
+                    acc[lane] += d * da * s as f32 * hsum(qd) - da * dmin * m as f32 * sa as f32;
+                }
+            }
+        }
+        for lane in 0..b {
+            out[lane] += acc[lane];
+        }
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q6_k_lanes(w: &[u8], k: usize, act: &Q8Act, out: &mut [f32], b: usize) {
+        let nb = k / 256;
+        let mut acc = [0f32; 64];
+        let mut we = [[0i8; 32]; 8];
+        for blk in 0..nb {
+            let base = blk * 210;
+            let d = crate::util::f16_to_f32(u16::from_le_bytes([w[base + 208], w[base + 209]]));
+            let ql = w.as_ptr().add(base);
+            let qh = w.as_ptr().add(base + 128);
+            for half in 0..2 {
+                let qlb = ql.add(half * 64);
+                let qhb = qh.add(half * 32);
+                for i in 0..32usize {
+                    let b0 = *qlb.add(i);
+                    let b1 = *qlb.add(i + 32);
+                    let hb = *qhb.add(i);
+                    we[4 * half + 0][i] = (((b0 & 0xF) | ((hb & 3) << 4)) as i16 - 32) as i8;
+                    we[4 * half + 1][i] = (((b1 & 0xF) | (((hb >> 2) & 3) << 4)) as i16 - 32) as i8;
+                    we[4 * half + 2][i] = ((((b0 >> 4) & 0xF) | (((hb >> 4) & 3) << 4)) as i16 - 32) as i8;
+                    we[4 * half + 3][i] = ((((b1 >> 4) & 0xF) | (((hb >> 6) & 3) << 4)) as i16 - 32) as i8;
+                }
+            }
+            let sc = w.as_ptr().add(base + 192);
+            for lane in 0..b {
+                let abl = lane * act.nb + blk * 8;
+                for half in 0..2 {
+                    for g in 0..2 {
+                        for s in 0..4 {
+                            let da = act.d[abl + 4 * half + s];
+                            let a = act
+                                .q
+                                .as_ptr()
+                                .add(lane * act.k + blk * 256 + (4 * half + s) * 32 + g * 16);
+                            let wa = we[4 * half + s].as_ptr().add(g * 16) as *const i8;
+                            let qd = vdotq_s32(vdupq_n_s32(0), vld1q_s8(wa), vld1q_s8(a));
+                            let scale = *sc.add(half * 8 + g + 2 * s) as i8 as f32;
+                            acc[lane] += d * scale * da * hsum(qd);
+                        }
+                    }
+                }
+            }
+        }
+        for lane in 0..b {
+            out[lane] += acc[lane];
+        }
+    }
+}

@@ -191,16 +191,14 @@ impl Pool {
                                 let out_slice =
                                     unsafe { core::slice::from_raw_parts_mut(out, job.b) };
                                 if !job.act.is_null() {
-                                    let a = unsafe { &*job.act };
-                                    for lane in 0..job.b {
-                                        out_slice[lane] = crate::quant_int::dot_row_q8(
-                                            job.ttype,
-                                            row_slice,
-                                            job.k,
-                                            a,
-                                            lane,
-                                        );
-                                    }
+                                    crate::quant_int::dot_row_q8_lanes(
+                                        job.ttype,
+                                        row_slice,
+                                        job.k,
+                                        unsafe { &*job.act },
+                                        out_slice,
+                                        job.b,
+                                    );
                                 } else {
                                     quant::row_dot_multi(
                                         job.ttype,
@@ -246,10 +244,7 @@ impl Pool {
             for r in 0..n_rows {
                 let row = unsafe { core::slice::from_raw_parts(w.add(r * row_bytes), row_bytes) };
                 if !act.is_null() {
-                    let a = unsafe { &*act };
-                    for lane in 0..b {
-                        out[r * b + lane] = crate::quant_int::dot_row_q8(ttype, row, k, a, lane);
-                    }
+                    crate::quant_int::dot_row_q8_lanes(ttype, row, k, unsafe { &*act }, &mut out[r * b..r * b + b], b);
                 } else {
                     quant::row_dot_multi(ttype, row, k, xt, b, &mut out[r * b..r * b + b]);
                 }

@@ -222,3 +222,136 @@ fn row_dot_multi_matches_dot_row() {
         assert!(d <= single[bi].abs() * 1e-4 + 1e-4, "lane {bi}: multi={} single={}", multi[bi], single[bi]);
     }
 }
+
+fn prng_bytes(state: &mut u64, out: &mut [u8]) {
+    for b in out.iter_mut() {
+        *b = prng(state) as u8;
+    }
+}
+
+fn random_act(state: &mut u64, k: usize, b: usize) -> pocketinfer::quant_int::Q8Act {
+    let mut act = pocketinfer::quant_int::Q8Act::new();
+    let mut x = vec![0f32; k * b];
+    for v in x.iter_mut() {
+        *v = ((prng(state) % 2000) as f32 / 1000.0) - 1.0;
+    }
+    act.prepare(&x, k, b);
+    act
+}
+
+#[test]
+fn int8_multi_matches_single_bitwise() {
+    if !pocketinfer::quant_int::int8_available() {
+        return;
+    }
+    let mut st = 4242u64;
+    let b = 32usize;
+    let k = 1024usize;
+    for ttype in [GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+        let (be, bb) = type_block(ttype).unwrap();
+        let nblk = k / be;
+        let mut row = vec![0u8; bb * nblk];
+        prng_bytes(&mut st, &mut row);
+        for blk in 0..nblk {
+            let base = blk * bb;
+            row[base..base + 2].copy_from_slice(&0x3200u16.to_le_bytes());
+            match ttype {
+                GGML_TYPE_Q4_K => {
+                    row[base + 2..base + 4].copy_from_slice(&0x2C00u16.to_le_bytes());
+                }
+                GGML_TYPE_Q6_K => {
+                    row[base + 208..base + 210].copy_from_slice(&0x3200u16.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+        let act = random_act(&mut st, k, b);
+        let mut multi = vec![0f32; b];
+        pocketinfer::quant_int::dot_row_q8_lanes(ttype, &row, k, &act, &mut multi, b);
+        let mut single = vec![0f32; b];
+        for lane in 0..b {
+            single[lane] = pocketinfer::quant_int::dot_row_q8(ttype, &row, k, &act, lane);
+        }
+        for lane in 0..b {
+            let diff = (multi[lane] - single[lane]).abs();
+            assert!(
+                diff <= single[lane].abs() * 1e-5 + 1e-4,
+                "type {ttype} lane {lane}: multi={} single={} diff={}",
+                multi[lane],
+                single[lane],
+                diff
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_multilane_vs_single() {
+    if !pocketinfer::quant_int::int8_available() {
+        return;
+    }
+    let mut st = 7u64;
+    let b = 32usize;
+    let k = 2048usize;
+    let rows = 512usize;
+    for ttype in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+        let (be, bb) = type_block(ttype).unwrap();
+        let row_bytes = bb * (k / be);
+        let mut row = vec![0u8; row_bytes];
+        prng_bytes(&mut st, &mut row);
+        for blk in 0..k / 256 {
+            row[blk * row_bytes / (k / 256)] = 0;
+        }
+        let act = random_act(&mut st, k, b);
+        let mut out = vec![0f32; b * rows];
+        let t1 = std::time::Instant::now();
+        for r in 0..rows {
+            pocketinfer::quant_int::dot_row_q8_lanes(ttype, &row, k, &act, &mut out[r * b..r * b + b], b);
+        }
+        let multi = t1.elapsed().as_secs_f64() * 1000.0;
+        let t2 = std::time::Instant::now();
+        for r in 0..rows {
+            for lane in 0..b {
+                out[r * b + lane] = pocketinfer::quant_int::dot_row_q8(ttype, &row, k, &act, lane);
+            }
+        }
+        let single = t2.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "type {ttype} rows={rows} b={b} k={k}: multi={multi:.1}ms single={single:.1}ms speedup={:.2}x",
+            single / multi
+        );
+    }
+}
+
+#[test]
+fn int8_multi_exact_bitwise() {
+    if !pocketinfer::quant_int::int8_available() {
+        return;
+    }
+    let mut st = 99u64;
+    let b = 32usize;
+    let k = 512usize;
+    for ttype in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+        let (be, bb) = type_block(ttype).unwrap();
+        let nblk = k / be;
+        let mut row = vec![0u8; bb * nblk];
+        prng_bytes(&mut st, &mut row);
+        for blk in 0..nblk {
+            let base = blk * bb;
+            row[base..base + 2].copy_from_slice(&0x3200u16.to_le_bytes());
+            if ttype == GGML_TYPE_Q4_K {
+                row[base + 2..base + 4].copy_from_slice(&0x2C00u16.to_le_bytes());
+            } else {
+                row[base + 208..base + 210].copy_from_slice(&0x3200u16.to_le_bytes());
+            }
+        }
+        let act = random_act(&mut st, k, b);
+        let mut multi = vec![0f32; b];
+        pocketinfer::quant_int::dot_row_q8_lanes(ttype, &row, k, &act, &mut multi, b);
+        for lane in 0..b {
+            let single = pocketinfer::quant_int::dot_row_q8(ttype, &row, k, &act, lane);
+            assert_eq!(multi[lane].to_bits(), single.to_bits(), "type {ttype} lane {lane}: multi={} single={}", multi[lane], single);
+        }
+    }
+}
