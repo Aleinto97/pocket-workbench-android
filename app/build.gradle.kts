@@ -11,8 +11,8 @@ android {
         applicationId = "com.pocketworkbench.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.3.1"
+        versionCode = 14
+        versionName = "0.3.2"
         ndk { abiFilters += "arm64-v8a" }
         externalNativeBuild { cmake {
             cppFlags += "-std=c++17"

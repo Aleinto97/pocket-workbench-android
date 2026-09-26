@@ -23,6 +23,8 @@ class NativeEngine {
         }
     }
 
+    init { ensureLoaded() }
+
     interface TokenCallback {
         fun onToken(piece: String)
         fun onStats(json: String)

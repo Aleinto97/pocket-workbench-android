@@ -654,10 +654,11 @@ impl Engine {
     }
 
     pub fn enable_opencl(&mut self) -> Result<()> {
-        let gpu = crate::backend::opencl::OpenClBackend::new()?;
+        let mut gpu = crate::backend::opencl::OpenClBackend::new()?;
+        gpu.selftest()?;
         util::log(
             util::ANDROID_LOG_INFO,
-            &format!("OpenCL GPU enabled: {}", gpu.name()),
+            &format!("OpenCL GPU enabled and verified: {}", gpu.name()),
         );
         self.gpu = Some(gpu);
         Ok(())

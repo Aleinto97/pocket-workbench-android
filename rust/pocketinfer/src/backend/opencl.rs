@@ -369,6 +369,53 @@ impl OpenClBackend {
         &self.device_name
     }
 
+    fn clear_weight_cache(&mut self) {
+        for (_, b) in self.weight_buffers.drain() {
+            (self.api.release_mem_object)(b);
+        }
+    }
+
+    pub fn selftest(&mut self) -> Result<()> {
+        let k = 256usize;
+        let mut x = vec![0f32; k];
+        for j in 0..k {
+            x[j] = ((j % 7) as f32) * 0.1 - 0.3;
+        }
+        let mut w4 = vec![0u8; 144];
+        w4[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        w4[4] = 1;
+        for i in 0..128 {
+            w4[16 + i] = 0x21;
+        }
+        let mut out4 = vec![0f32; 1];
+        self.matvec(GGML_TYPE_Q4_K, &w4, k, &x, &mut out4)?;
+        let want4 = crate::quant::dot_row(GGML_TYPE_Q4_K, &w4, k, &x);
+        if (out4[0] - want4).abs() > want4.abs() * 0.02 + 0.01 {
+            self.clear_weight_cache();
+            bail!("q4_K self-test failed: gpu={} cpu={}", out4[0], want4);
+        }
+        let mut w6 = vec![0u8; 210];
+        for i in 0..128 {
+            w6[i] = 0x95;
+        }
+        for i in 0..64 {
+            w6[128 + i] = 0x1B;
+        }
+        for i in 0..16 {
+            w6[192 + i] = 2;
+        }
+        w6[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+        let mut out6 = vec![0f32; 1];
+        self.matvec(GGML_TYPE_Q6_K, &w6, k, &x, &mut out6)?;
+        let want6 = crate::quant::dot_row(GGML_TYPE_Q6_K, &w6, k, &x);
+        if (out6[0] - want6).abs() > want6.abs() * 0.02 + 0.01 {
+            self.clear_weight_cache();
+            bail!("q6_K self-test failed: gpu={} cpu={}", out6[0], want6);
+        }
+        self.clear_weight_cache();
+        Ok(())
+    }
+
     pub fn supports(&self, ttype: u32) -> bool {
         self.kernels.contains_key(&ttype)
     }

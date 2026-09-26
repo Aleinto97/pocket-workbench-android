@@ -479,6 +479,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         val buffer = StringBuilder()
         Diag.log("gen", "local turn start: promptMsgs=${roles.size} threads=$genThreads ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""} replyIndex=$replyIndex")
         try {
+            NativeEngine.ensureLoaded()?.let { throw IllegalStateException("Native engine not loaded: $it") }
             native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
                 override fun onToken(piece: String) {
                     if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
@@ -514,6 +515,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size} ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""}")
             var stepFailed = false
             try {
+                NativeEngine.ensureLoaded()?.let { throw IllegalStateException("Native engine not loaded: $it") }
                 native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
                     override fun onToken(piece: String) {
                         if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
@@ -579,7 +581,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     fun stop() {
         Diag.log("gen", "user requested stop at chunks=$tokenCount (ttft=${firstTokenMs}ms)")
         stopRequested = true
-        native.stop(); workspaceTools.stop(); status = "Stopping…"
+        runCatching { native.stop() }; workspaceTools.stop(); status = "Stopping…"
     }
 
     // ---------- Voice ----------

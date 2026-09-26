@@ -8,7 +8,7 @@
 - **GGUF loader**: metadata v2/v3, tensor table, mmap zero-copy weights, dequant for F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K/Q2_K/Q3_K.
 - **Tokenizer**: exact GPT-2 byte-level BPE with the `minicpm5` (and `gpt-2`, `qwen2`, `llama3`) pre-tokenizer splits, special-token parsing, `MiniCPM5` chat template and the documented direct-answer (`enable_thinking=false`) prefix.
 - **CPU backend**: aarch64 NEON kernels, an int8 `dotprod` path for Q4_K/Q6_K/Q4_0/Q8_0 matmuls, persistent worker pool. Best measured with 4 threads on the reference device.
-- **GPU backend (experimental)**: Adreno OpenCL via `dlopen` (runtime-compiled kernels, no external shader toolchain). It is used only when the user selects GPU and silently falls back to CPU on any error; it has not been device-verified yet.
+- **GPU backend (experimental)**: Adreno OpenCL via `dlopen` (runtime-compiled kernels, no external shader toolchain). It is used only when the user selects GPU, and only after an on-device self-test against the CPU kernels; any failure falls back to CPU automatically.
 - **NPU**: the engine detects a QNN/Hexagon runtime and a `.qnn` context binary next to the GGUF, reports it in Stats, and keeps CPU/GPU until on-device QNN execution lands (see roadmap).
 - **Memory safety net**: Rust-side signal forensics still writes `native_state.txt`/`native_crash.txt` (phase, op, token counts, backend) so the existing Diagnostics screen keeps working; Rust panics are caught at the JNI boundary and reported instead of killing the app.
 - **New Statistics page**: native library load status, engine capabilities (NEON/int8 dotprod/OpenCL/QNN), loaded model details (architecture, sizes, KV cache, weights by quantization type), a one-tap **health check** that runs file → GGUF → tokenizer → engine load → prefill → sampling on the selected model and reports the exact failing step, engine errors recorded in the run history, plus the previous crash/diagnostics log.
@@ -17,8 +17,9 @@
 
 - Tokenizer parity with llama.cpp: identical token ids on the test corpus (including digit chunking and `minicpm5` pre-tokenizer).
 - Greedy generation parity with llama.cpp on the real MiniCPM5-2B GGUF: 16/16 identical tokens.
-- Decode ≈ 12.5 tok/s and prefill ≈ 12 tok/s with 4 threads (llama.cpp CPU on the same device/thermal state: 7.5 tok/s decode, 12.3 tok/s prefill). The worker pool steals row chunks across threads and the int8 `dotprod` path keeps weights read once per token.
+- Decode ≈ 12.5 tok/s and prefill ≈ 12 tok/s on the CPU backend with 4 threads (release session on the reference tablet; worker pool steals row chunks, int8 `dotprod` keeps weights read once per token). The tablet's own llama.cpp history (v0.2.x) shows 22–28 tok/s CPU at 4K context and up to 26.9 tok/s on the Vulkan build in cool conditions, so the Rust engine is still behind llama.cpp's tuned kernels: the roadmap is i8mm batched GEMM, a **verified** OpenCL GPU path and QNN offload.
 - The engine is validated token-for-token against llama.cpp on the raw-prompt corpus; with the full ChatML chat template the first tokens agree and later greedy tokens can differ only from activation-quantization noise (both engines quantize activations to 8 bit).
+- The OpenCL GPU backend runs a **self-test** (synthetic Q4_K/Q6_K matvec compared against the CPU kernel) before it is used; if the kernels do not match on the device the engine falls back to CPU and Stats reports `gpu_fallback`.
 
 ## Implemented
 
