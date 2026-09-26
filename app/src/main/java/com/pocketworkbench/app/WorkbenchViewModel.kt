@@ -112,16 +112,32 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     }
 
     // ---------- Engine diagnostics (Stats) ----------
-    var engineRefresh by androidx.compose.runtime.mutableIntStateOf(0); private set
+    var engineInfoSnapshot by androidx.compose.runtime.mutableStateOf("{\"loaded\":true,\"busy\":false,\"engine\":\"Loading…\",\"model\":null}"); private set
+    var engineInfoLoading by androidx.compose.runtime.mutableStateOf(true); private set
     var healthRunning by androidx.compose.runtime.mutableStateOf(false); private set
     var healthReport by androidx.compose.runtime.mutableStateOf<DiagReport?>(null); private set
     var lastEngineError by androidx.compose.runtime.mutableStateOf(""); private set
+    private var engineInfoRequest = 0
 
-    fun engineInfoJson(): String = native.infoJson()
+    fun engineInfoJson(): String = engineInfoSnapshot
 
-    fun refreshEngineInfo() { engineRefresh++ }
+    fun refreshEngineInfo() {
+        viewModelScope.launch(Dispatchers.Main) {
+            val request = ++engineInfoRequest
+            engineInfoLoading = true
+            val snapshot = withContext(Dispatchers.IO) {
+                try { native.infoJson() }
+                catch (t: Throwable) { "{\"loaded\":false,\"error\":${JSONObject.quote(t.toString())}}" }
+            }
+            if (request == engineInfoRequest) {
+                engineInfoSnapshot = snapshot
+                engineInfoLoading = false
+            }
+        }
+    }
 
     fun runHealthCheck() {
+        if (busy) { status = "Wait for generation to finish before running a health check"; return }
         val model = selectedModel ?: installed.firstOrNull()
         if (model == null) { status = "Select or import a model first"; return }
         if (healthRunning) return

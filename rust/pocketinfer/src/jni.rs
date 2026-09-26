@@ -565,14 +565,14 @@ pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_engineInfo(
     _this: JObject,
 ) -> JString {
     let j = Jni { env };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine_info_json(&j)));
+    let result = std::panic::catch_unwind(engine_info_json);
     match result {
         Ok(json) => j.new_string_utf(&to_modified_utf8(json.as_bytes())),
         Err(_) => j.new_string_utf(&to_modified_utf8(b"{\"loaded\":false,\"error\":\"internal panic\"}")),
     }
 }
 
-fn engine_info_json(_j: &Jni) -> String {
+fn engine_info_json() -> String {
     let mut caps = String::new();
     caps.push_str(&format!("\"engine\":\"pocketinfer-{}\"", env!("CARGO_PKG_VERSION")));
     caps.push_str(&format!(",\"abi\":\"aarch64\""));
@@ -585,7 +585,13 @@ fn engine_info_json(_j: &Jni) -> String {
     let npu = crate::backend::npu::inspect("");
     caps.push_str(&format!(",\"qnn\":\"{}\"", json_escape_str(&npu.description)));
     let mut model = "null".to_string();
-    if let Ok(guard) = cache().lock() {
+    let guard = match cache().try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let busy = guard.is_none();
+    if let Some(guard) = guard {
         if let Some(engine) = guard.engine.as_ref() {
             let cfg = &engine.model.cfg;
             let mut types = String::new();
@@ -623,7 +629,28 @@ fn engine_info_json(_j: &Jni) -> String {
             );
         }
     }
-    format!("{{\"loaded\":true,{},\"model\":{}}}", caps, model)
+    format!("{{\"loaded\":true,\"busy\":{}, {},\"model\":{}}}", busy, caps, model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn engine_info_does_not_wait_for_generation() {
+        let guard = cache().lock().unwrap();
+        let (send, recv) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            send.send(engine_info_json()).unwrap();
+        });
+        let result = recv.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        let info = result.expect("engineInfo must not wait for the generation mutex");
+        thread.join().unwrap();
+        assert!(info.contains("\"busy\":true"), "{info}");
+    }
 }
 
 #[no_mangle]

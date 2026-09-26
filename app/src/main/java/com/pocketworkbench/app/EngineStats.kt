@@ -5,6 +5,7 @@ import org.json.JSONObject
 data class EngineCapabilities(
     val version: String,
     val abi: String,
+    val busy: Boolean,
     val neon: Boolean,
     val dotprod: Boolean,
     val opencl: String?,
@@ -40,6 +41,7 @@ object EngineStatsParser {
     private fun caps(o: JSONObject): EngineCapabilities = EngineCapabilities(
         version = o.optString("engine", "?"),
         abi = o.optString("abi", "?"),
+        busy = o.optBoolean("busy", false),
         neon = o.optBoolean("neon", false),
         dotprod = o.optBoolean("dotprod", false),
         opencl = if (o.isNull("opencl")) null else o.optString("opencl", null),
@@ -98,6 +100,7 @@ object EngineStatsParser {
         val c = EngineCapabilities(
             version = co.optString("engine", "?"),
             abi = "aarch64",
+            busy = false,
             neon = true,
             dotprod = co.optBoolean("dotprod", false),
             opencl = if (co.isNull("opencl")) null else co.optString("opencl", null),

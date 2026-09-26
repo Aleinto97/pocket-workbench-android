@@ -31,6 +31,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,8 +61,9 @@ fun StatsScreen(vm: WorkbenchViewModel) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     val entries = vm.perfEntries
-    val refresh = vm.engineRefresh
-    val (caps, modelInfo) = remember(refresh) { EngineStatsParser.parseInfo(vm.engineInfoJson()) }
+    val info = vm.engineInfoSnapshot
+    val (caps, modelInfo) = remember(info) { EngineStatsParser.parseInfo(info) }
+    LaunchedEffect(vm, vm.busy) { vm.refreshEngineInfo() }
     val health = vm.healthReport
     val problems = entries.filter { it.problem.isNotBlank() || it.error.isNotBlank() }
     var confirmClear by remember { mutableStateOf(false) }
@@ -88,7 +90,7 @@ fun StatsScreen(vm: WorkbenchViewModel) {
             dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
         )
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 8.dp)) {
-            item { EngineCard(caps, modelInfo) }
+            item { EngineCard(caps, modelInfo, vm.engineInfoLoading) }
             item { HealthCheckCard(vm, health) }
             item { LatestRunCard(entries.firstOrNull()) }
             if (problems.isNotEmpty()) item { ProblemsCard(problems) }
@@ -117,7 +119,7 @@ private fun Card(title: String, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun EngineCard(caps: EngineCapabilities, model: ModelInfo?) {
+private fun EngineCard(caps: EngineCapabilities, model: ModelInfo?, loading: Boolean) {
     Card("Engine") {
         if (caps.loadError != null) {
             Text("FAILED TO LOAD libpocketinfer.so", style = MaterialTheme.typography.titleSmall, color = SWarn)
@@ -127,10 +129,13 @@ private fun EngineCard(caps: EngineCapabilities, model: ModelInfo?) {
             Text("${caps.version} · ${caps.abi} · NEON ${yes(caps.neon)} · int8 dotprod ${yes(caps.dotprod)}", style = MaterialTheme.typography.titleSmall)
             Text("OpenCL: ${caps.opencl ?: "not available"} · QNN/NPU: ${caps.qnn.ifBlank { "not available" }}", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         }
+        if (loading || caps.busy) {
+            Text(if (caps.busy) "Generation in progress; model details will update when it finishes." else "Reading engine details…", style = MaterialTheme.typography.bodySmall, color = SIndigo)
+        }
         Spacer(Modifier.height(8.dp))
-        if (model == null) {
+        if (model == null && !loading && !caps.busy) {
             Text("No model loaded yet. Send a message in Chat or run the health check.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-        } else {
+        } else if (model != null) {
             Text(model.file, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text("${model.arch} · ${model.layers} layers · hidden ${model.hidden} · ${model.heads}/${model.kvHeads} heads · head ${model.headDim} · vocab ${model.vocab}", style = MaterialTheme.typography.bodySmall)
             Text("File ${mb(model.fileBytes)} · KV cache ${mb(model.kvBytes)} · ctx ${model.ctx} · threads ${model.threads} · backend ${model.backend}", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
@@ -150,7 +155,7 @@ private fun HealthCheckCard(vm: WorkbenchViewModel, report: DiagReport?) {
         Text("Runs a step-by-step check on the selected model: file, GGUF metadata, tokenizer, engine load, prefill and sampling. Every step reports its own error.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = { vm.runHealthCheck() }, enabled = !vm.healthRunning) {
+            Button(onClick = { vm.runHealthCheck() }, enabled = !vm.healthRunning && !vm.busy) {
                 Icon(Icons.Default.Speed, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
                 Text(if (vm.healthRunning) "Running…" else "Run health check")
             }
