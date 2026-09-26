@@ -38,7 +38,7 @@ build-apk:
     - ls -la PocketWorkbench-debug.apk
     # --- Unstripped native libs: needed to symbolicate native crash reports
     # (bridge.cpp writes pc=<lib>+0xoffset; llvm-symbolizer needs these exact .so)
-    - 'SYMDIR=$( (ls -d app/build/intermediates/cxx/*/obj/arm64-v8a app/.cxx/*/obj/arm64-v8a 2>/dev/null || true) | head -1 )'
+    - 'SYMDIR=$( (ls -d app/build/intermediates/cxx/Debug/*/obj/arm64-v8a app/build/intermediates/cxx/Release/*/obj/arm64-v8a app/.cxx/Debug/*/obj/arm64-v8a app/.cxx/Release/*/obj/arm64-v8a 2>/dev/null || true) | head -1 )'
     - 'if [ -n "$SYMDIR" ] && ls "$SYMDIR"/*.so >/dev/null 2>&1; then mkdir -p native-symbols && cp "$SYMDIR"/*.so native-symbols/ && tar czf native-symbols.tgz -C native-symbols . && ls -la native-symbols; else echo "WARN no unstripped native libs (SYMDIR=$SYMDIR)"; fi'
     # --- Pubblica APK nel registry dei pacchetti (URL di download stabile) ---
     - |
