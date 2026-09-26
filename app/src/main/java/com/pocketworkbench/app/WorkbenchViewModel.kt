@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -23,6 +24,7 @@ import java.io.File
 class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private val completedReasoning = Regex("<think>[\\s\\S]*?</think>", RegexOption.IGNORE_CASE)
     private val store = PrivateStore(app)
+    private val workspaceTools = WorkspaceTools(app, store.workspace)
     private val hub = HubClient()
     private val native = NativeEngine()
     private val gh = GitHubClient(app)
@@ -39,7 +41,16 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     var listening by androidx.compose.runtime.mutableStateOf(false); private set
     var status by androidx.compose.runtime.mutableStateOf("Ready"); private set
     var transcript by androidx.compose.runtime.mutableStateOf(""); private set
-    var terminalOutput by androidx.compose.runtime.mutableStateOf("Workspace is private to this app. Commands use Android's shell.\n"); private set
+    var fileRevision by androidx.compose.runtime.mutableIntStateOf(0); private set
+    fun refreshFiles() { fileRevision++ }
+    fun listWorkspace(path: String): List<File> = workspaceTools.list(path)
+    fun previewWorkspace(path: String): String = workspaceTools.preview(path)
+    fun exportWorkspace(path: String, uri: Uri) = viewModelScope.launch(Dispatchers.IO) {
+        try {
+            workspaceTools.export(path, uri)
+            withContext(Dispatchers.Main) { status = "Export complete" }
+        } catch (e: Exception) { withContext(Dispatchers.Main) { status = "Export failed: ${e.message}" } }
+    }
 
     // GitHub account state
     var ghLoggedIn by androidx.compose.runtime.mutableStateOf(false); private set
@@ -49,7 +60,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     var ghUserCode by androidx.compose.runtime.mutableStateOf(""); private set
     var ghPolling by androidx.compose.runtime.mutableStateOf(false); private set
     var ghClientId by androidx.compose.runtime.mutableStateOf(gh.clientId)
-    var agentMode by androidx.compose.runtime.mutableStateOf(config.getBoolean("agent_mode", false)); private set
+    var agentMode by androidx.compose.runtime.mutableStateOf(config.getBoolean("agent_mode", true)); private set
     var toolStatus by androidx.compose.runtime.mutableStateOf(""); private set
 
     // llama.cpp #28878 (SIGSEGV in CPU path with 6+ threads on Android/aarch64):
@@ -101,6 +112,12 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private var lastUiFlushMs = 0L
 
     init {
+        // Enable the new local agent once for existing installations; later user
+        // choices remain persistent even when GitHub is not connected.
+        if (!config.getBoolean("local_agent_migrated", false)) {
+            agentMode = true
+            config.edit().putBoolean("agent_mode", true).putBoolean("local_agent_migrated", true).apply()
+        }
         conversations.addAll(sanitizeHistory(store.readHistory()))
         if (conversations.isEmpty()) conversations.add(store.newChat())
         activeId = conversations.first().id
@@ -189,7 +206,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     fun toggleAgentMode() {
         agentMode = !agentMode
         config.edit().putBoolean("agent_mode", agentMode).apply()
-        if (agentMode && !ghLoggedIn) status = "Agent mode on: sign in on the GitHub page to enable tools"
+        if (agentMode) status = "Agent can create local files; sign in to GitHub for repository tools"
     }
 
     // ---------- Diagnostics API (Stats page) ----------
@@ -298,8 +315,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         val model = selectedModel ?: run { status = "Download or import a GGUF model first"; return }
         val chat = active ?: return
         if (busy || text.isBlank()) return
-        val useAgent = agentMode && ghLoggedIn
-        if (agentMode && !ghLoggedIn) status = "Agent mode needs GitHub sign-in; replying locally for now"
+        val useAgent = agentMode
         chat.messages.add(ChatMessage("user", text.trim()))
         if (chat.title == "New conversation") { val idx = conversations.indexOf(chat); conversations[idx] = chat.copy(title = text.take(45)); }
         val idx = conversations.indexOfFirst { it.id == chat.id }
@@ -350,7 +366,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     private fun modelSnapshot(chatId: String, uptoReplyIndex: Int, includeSystem: Boolean): Pair<Array<String>, Array<String>> {
         val chat = conversations.find { it.id == chatId } ?: return emptyArray<String>() to emptyArray<String>()
         val pre = mutableListOf<ChatMessage>()
-        if (includeSystem) pre.add(ChatMessage("system", McpTools.systemPrompt()))
+        if (includeSystem) pre.add(ChatMessage("system", McpTools.systemPrompt(workspaceTools, ghLoggedIn)))
         chat.messages.take(uptoReplyIndex).forEach { m ->
             when {
                 m.text.isBlank() -> {}
@@ -461,7 +477,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 status = "Agent: ${call.name}"
             }
             if (stopRequested) break
-            val result = McpTools.execute(call, gh)
+            val result = McpTools.execute(call, gh, workspaceTools, ghLoggedIn)
+            if (call.name.startsWith("workspace_")) withContext(Dispatchers.Main) { refreshFiles() }
             Diag.log("agent", "step $step: tool ${call.name} result: ${result.take(160).replace('\n', ' ')}")
             addMessage(chatId, ChatMessage("tool_result", "[TOOL RESULT name=${call.name}]\n$result"))
             if (stopRequested) break
@@ -477,7 +494,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     fun stop() {
         Diag.log("gen", "user requested stop at chunks=$tokenCount (ttft=${firstTokenMs}ms)")
         stopRequested = true
-        native.stop(); status = "Stopping…"
+        native.stop(); workspaceTools.stop(); status = "Stopping…"
     }
 
     // ---------- Voice ----------
@@ -519,27 +536,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
     fun stopRecording() { listening = false }
     fun clearTranscript() { transcript = "" }
 
-    // ---------- Workspace shell ----------
-    fun runShell(command: String) = viewModelScope.launch(Dispatchers.IO) {
-        if (command.isBlank()) return@launch
-        withContext(Dispatchers.Main) { terminalOutput += "\n$ $command\n" }
-        try {
-            val process = ProcessBuilder("/system/bin/sh", "-c", command)
-                .directory(workspace).redirectErrorStream(true).start()
-            val reader = process.inputStream.bufferedReader()
-            var length = 0
-            while (true) {
-                val line = reader.readLine() ?: break
-                length += line.length
-                if (length > 128_000) { process.destroyForcibly(); throw IllegalStateException("Output limit exceeded") }
-                withContext(Dispatchers.Main) { terminalOutput += "$line\n" }
-            }
-            val code = process.waitFor()
-            withContext(Dispatchers.Main) { terminalOutput += "Exit code: $code\n" }
-        } catch (e: Exception) { withContext(Dispatchers.Main) { terminalOutput += "Error: ${e.message}\n" } }
-    }
     override fun onCleared() {
         Diag.log("vm", "onCleared (activity torn down) busy=$busy tokens=$tokenCount")
-        native.stop(); listening = false; generation?.cancel(); ghJob?.cancel(); recording?.cancel(); super.onCleared()
+        native.stop(); workspaceTools.stop(); listening = false; generation?.cancel(); ghJob?.cancel(); recording?.cancel(); super.onCleared()
     }
 }

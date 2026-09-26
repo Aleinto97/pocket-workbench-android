@@ -219,16 +219,21 @@ object McpTools {
 
     private val byName = tools.associateBy { it.name }
 
-    fun systemPrompt(): String = buildString {
-        appendLine("You are Pocket Workbench, an assistant running fully offline on an Android tablet, with GitHub tools.")
+    fun systemPrompt(workspace: WorkspaceTools, githubAvailable: Boolean): String = buildString {
+        appendLine("You are Pocket Workbench. Build requested projects in the local workspace using the tools below. The workspace has Android's shell and app-private files; it is not a full Linux distribution. Check which commands are installed before relying on them.")
+        appendLine("For a requested app or website, create real project files, inspect results, run available checks, and then report actual file paths and any limitations. Do not claim execution or success without a tool result.")
         appendLine("To call a tool, output exactly one tag with JSON, then stop and wait:")
-        appendLine("<tool>{\"name\":\"github_read_file\",\"arguments\":{\"owner\":\"me\",\"repo\":\"demo\",\"path\":\"README.md\"}}</tool>")
-        appendLine("You may also use MiniCPM5's native XML form: <function name=\"github_read_file\"><param name=\"owner\">me</param><param name=\"repo\">demo</param><param name=\"path\">README.md</param></function>.")
+        appendLine("<tool>{\"name\":\"workspace_write\",\"arguments\":{\"path\":\"index.html\",\"content\":\"<!doctype html>...\"}}</tool>")
+        appendLine("You may also use XML: <function name=\"workspace_list\"><param name=\"path\">.</param></function>.")
         appendLine("After your call you will receive a message starting with [TOOL RESULT]. Never invent tool results.")
         appendLine("Call another tool, or reply with plain text when you have enough information (that ends the turn).")
         appendLine("Rules: one tool call per reply; owner and repo are separate fields; file paths are repo-relative; dates are ISO.")
-        appendLine("Available tools:")
-        tools.forEach { appendLine("- ${it.signature}: ${it.description}") }
+        appendLine("Local project tools:")
+        workspace.signatures.forEach { appendLine("- $it") }
+        if (githubAvailable) {
+            appendLine("GitHub tools (network access):")
+            tools.forEach { appendLine("- ${it.signature}: ${it.description}") }
+        }
     }
 
     fun parse(text: String): McpParseResult {
@@ -254,7 +259,7 @@ object McpTools {
                     }
                     parser.next()
                 }
-                if (name !in byName) McpParseResult(null, true, raw)
+                if (name !in byName && name !in localNames) McpParseResult(null, true, raw)
                 else McpParseResult(McpToolCall(name, arguments), true, raw)
             } catch (_: Exception) { McpParseResult(null, true, raw) }
         }
@@ -265,12 +270,20 @@ object McpTools {
             if (start < 0 || end <= start) return McpParseResult(null, true, raw)
             val json = JSONObject(raw.substring(start, end + 1))
             val name = json.optString("name", "")
-            if (name.isBlank() || !byName.containsKey(name)) return McpParseResult(null, true, raw)
+            if (name.isBlank() || (name !in byName && name !in localNames)) return McpParseResult(null, true, raw)
             McpParseResult(McpToolCall(name, json.optJSONObject("arguments") ?: JSONObject()), true, raw)
         } catch (_: Exception) { McpParseResult(null, true, raw) }
     }
 
-    suspend fun execute(call: McpToolCall, gh: GitHubClient): String {
+    private val localNames = setOf("workspace_list", "workspace_read", "workspace_write", "workspace_run")
+
+    suspend fun execute(call: McpToolCall, gh: GitHubClient, workspace: WorkspaceTools, githubAvailable: Boolean): String {
+        if (call.name in localNames) return try {
+            JSONObject().put("ok", true).put("tool", call.name).put("result", workspace.execute(call.name, call.arguments)).toString()
+        } catch (e: Exception) {
+            JSONObject().put("ok", false).put("tool", call.name).put("error", e.message ?: "failed").toString()
+        }
+        if (!githubAvailable) return JSONObject().put("ok", false).put("error", "GitHub sign-in required").toString()
         val def = byName[call.name] ?: return JSONObject().put("ok", false).put("error", "Unknown tool ${call.name}").toString()
         return try {
             JSONObject().put("ok", true).put("tool", call.name).put("result", def.handler(call.arguments, gh)).toString()

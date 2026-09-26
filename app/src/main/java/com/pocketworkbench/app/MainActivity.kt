@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -104,7 +105,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                     NavigationRailItem(selected = page == Page.Chat, onClick = { page = Page.Chat }, icon = { Icon(Icons.Default.ChatBubbleOutline, "Chat") }, label = { Text("Chat") })
                     NavigationRailItem(selected = page == Page.Models, onClick = { page = Page.Models }, icon = { Icon(Icons.Default.Download, "Models") }, label = { Text("Models") })
                     NavigationRailItem(selected = page == Page.Stats, onClick = { page = Page.Stats }, icon = { Icon(Icons.Default.Speed, "Stats") }, label = { Text("Stats") })
-                    NavigationRailItem(selected = page == Page.Workspace, onClick = { page = Page.Workspace }, icon = { Icon(Icons.Default.Terminal, "Workspace") }, label = { Text("Files") })
+                    NavigationRailItem(selected = page == Page.Workspace, onClick = { page = Page.Workspace }, icon = { Icon(Icons.Default.FolderOpen, "Files") }, label = { Text("Files") })
                     NavigationRailItem(selected = page == Page.GitHub, onClick = { page = Page.GitHub }, icon = { Icon(Icons.Default.Code, "GitHub") }, label = { Text("GitHub") })
                 }
                 if (page == Page.Chat && wide) ConversationSidebar(vm, Modifier.width(250.dp).fillMaxHeight())
@@ -126,7 +127,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                         Page.Chat -> Icons.Default.ChatBubbleOutline
                         Page.Models -> Icons.Default.Download
                         Page.Stats -> Icons.Default.Speed
-                        Page.Workspace -> Icons.Default.Terminal
+                        Page.Workspace -> Icons.Default.FolderOpen
                         Page.GitHub -> Icons.Default.Code
                     }
                     NavigationBarItem(selected = page == destination, onClick = { page = destination },
@@ -191,9 +192,9 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             }
             Text(chat?.title ?: "Chat", style = MaterialTheme.typography.titleLarge, maxLines = 1, modifier = Modifier.weight(1f))
             IconButton(onClick = {
-                clipboard.setText(AnnotatedString(vm.exportPerfLog()))
-                Toast.makeText(context, "Performance log copied", Toast.LENGTH_SHORT).show()
-            }, modifier = Modifier.semantics { contentDescription = "Copy performance log" }) { Icon(Icons.Default.ContentCopy, "Copy performance log") }
+                clipboard.setText(AnnotatedString(chat?.messages?.joinToString("\n\n") { "${it.role}: ${it.text}" }.orEmpty()))
+                Toast.makeText(context, "Chat copied", Toast.LENGTH_SHORT).show()
+            }, modifier = Modifier.semantics { contentDescription = "Copy conversation" }) { Icon(Icons.Default.ContentCopy, "Copy conversation") }
         }
         Row(Modifier.fillMaxWidth().padding(bottom = 8.dp).horizontalScroll(rememberScrollState()),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -238,6 +239,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
                         Surface(color = if (message.role == "user") Color(0xFF304C7C) else Panel, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 760.dp)) {
                             Column(Modifier.padding(16.dp)) {
                                 Text(if (message.role == "user") "YOU" else "ASSISTANT", style = MaterialTheme.typography.labelSmall, color = Indigo)
+                                TextButton(onClick = { clipboard.setText(AnnotatedString(message.text)) }) { Text("Copy") }
                                 Spacer(Modifier.height(6.dp))
                                 if (message.role == "assistant") AssistantReply(message.text) else Text(message.text, style = MaterialTheme.typography.bodyLarge)
                                 if (message.perf.isNotBlank() && message.role == "assistant") {
@@ -528,21 +530,51 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
     }
 }
 @Composable private fun WorkspacePage(vm: WorkbenchViewModel) {
-    var command by remember { mutableStateOf("") }
+    var folder by remember { mutableStateOf("") }
+    var opened by remember { mutableStateOf<String?>(null) }
+    var exportPath by remember { mutableStateOf("") }
+    val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+        if (uri != null) vm.exportWorkspace(exportPath, uri)
+    }
+    val files = remember(folder, vm.fileRevision) { runCatching { vm.listWorkspace(folder) }.getOrDefault(emptyList()) }
+    fun save(path: String, filename: String) {
+        exportPath = path
+        export.launch(filename)
+    }
     Column(Modifier.fillMaxSize().padding(24.dp)) {
-        Text("Workspace", style = MaterialTheme.typography.headlineMedium)
-        Text("App-private Android shell · ${vm.workspace.absolutePath}", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
-        Text("The assistant does not execute commands automatically. This is not a Linux container.", style = MaterialTheme.typography.bodySmall, color = Indigo)
-        Spacer(Modifier.height(16.dp))
-        Surface(color = Console, shape = RoundedCornerShape(12.dp), modifier = Modifier.weight(1f).fillMaxWidth()) {
-            val state = rememberLazyListState()
-            LaunchedEffect(vm.terminalOutput.length) { state.scrollToItem(0) }
-            LazyColumn(state = state, modifier = Modifier.padding(16.dp)) { item { Text(vm.terminalOutput, style = MaterialTheme.typography.bodyMedium) } }
+        Text("Files", style = MaterialTheme.typography.headlineMedium)
+        Text("Projects created by the assistant appear here. Open a file or export a folder as ZIP.",
+            style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+        Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (folder.isNotEmpty()) TextButton(onClick = { folder = folder.substringBeforeLast('/', ""); opened = null }) { Text("← Back") }
+            Text(if (folder.isEmpty()) "Workspace" else "Workspace / $folder", modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 12.dp)) {
-            OutlinedTextField(command, { command = it }, label = { Text("Shell command") }, modifier = Modifier.weight(1f), singleLine = true)
-            Spacer(Modifier.width(8.dp))
-            Button(onClick = { vm.runShell(command); command = "" }, enabled = command.isNotBlank()) { Text("Run") }
+        Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.End) {
+            TextButton(onClick = { vm.refreshFiles() }) { Text("Refresh") }
+            OutlinedButton(onClick = { save(folder, if (folder.isEmpty()) "workspace.zip" else folder.substringAfterLast('/') + ".zip") }) { Text("Export ZIP") }
+        }
+        HorizontalDivider()
+        LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (files.isEmpty()) item { Text("No files yet. Ask the assistant to create a project in Chat.", modifier = Modifier.padding(16.dp)) }
+            items(files, key = { it.absolutePath }) { file ->
+                val relative = if (folder.isEmpty()) file.name else "$folder/${file.name}"
+                Surface(color = Panel, shape = RoundedCornerShape(10.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = {
+                            if (file.isDirectory) { folder = relative; opened = null } else opened = relative
+                        }, modifier = Modifier.weight(1f)) {
+                            Text("${if (file.isDirectory) "📁" else "📄"} ${file.name}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        TextButton(onClick = { save(relative, file.name + if (file.isDirectory) ".zip" else "") }) { Text("Export") }
+                    }
+                }
+            }
+        }
+        opened?.let { path ->
+            val preview = remember(path, vm.fileRevision) { runCatching { vm.previewWorkspace(path) }.getOrElse { it.message ?: "Cannot open file" } }
+            AlertDialog(onDismissRequest = { opened = null }, title = { Text(path.substringAfterLast('/')) },
+                text = { SelectionContainer { Text(preview, modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) } },
+                confirmButton = { TextButton(onClick = { opened = null }) { Text("Close") } })
         }
     }
 }
@@ -622,7 +654,7 @@ private enum class Page { Chat, Models, Stats, Workspace, GitHub }
             Surface(color = Panel, shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp)) {
                     Text("Why sign in?", style = MaterialTheme.typography.titleSmall)
-                    Text("Agent mode in Chat: the on-device model can read your repositories, commit files, open issues and PRs, and trigger or inspect GitHub Actions builds — no token pasting in chat needed.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
+                    Text("Local project tools work without sign-in. Connect GitHub to let the assistant read repositories, commit files, open issues and PRs, and inspect or trigger Actions builds.", style = MaterialTheme.typography.bodySmall, color = Color.LightGray)
                 }
             }
         }
