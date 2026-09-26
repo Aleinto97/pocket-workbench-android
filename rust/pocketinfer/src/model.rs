@@ -147,7 +147,7 @@ impl Pool {
             shutdown: AtomicBool::new(false),
         });
         let mut workers = Vec::new();
-        for _ in 0..n {
+        for _ in 0..if n == 1 { 0 } else { n } {
             let gen = gen.clone();
             let done = done.clone();
             let shared = shared.clone();
@@ -689,9 +689,16 @@ impl Engine {
     }
 
     pub fn forward(&mut self, ids: &[u32], positions: &[usize], want_logits: bool) -> Result<()> {
+        self.forward_inner(ids, positions, want_logits, false)
+    }
+
+    fn forward_inner(&mut self, ids: &[u32], positions: &[usize], want_logits: bool, cancellable: bool) -> Result<()> {
         let b = ids.len();
         if b == 0 || b > MAX_BATCH {
             bail!("invalid batch {b}");
+        }
+        if positions.len() != b {
+            bail!("batch positions do not match tokens");
         }
         let cfg = self.model.cfg.clone();
         let ne = cfg.n_embd;
@@ -734,16 +741,16 @@ impl Engine {
         let mut proj = core::mem::take(&mut self.scratch.proj);
         let mut gate = core::mem::take(&mut self.scratch.gate);
         let mut up = core::mem::take(&mut self.scratch.up);
-        {
+        let result = {
             let layers = std::mem::take(&mut self.model.layers);
             let result = self.forward_layers(
-                ids, positions, want_logits, &cfg, b, ne, dh, qdim, kdim, &layers, x.as_mut_slice(),
+                ids, positions, want_logits, cancellable, &cfg, b, ne, dh, qdim, kdim, &layers, x.as_mut_slice(),
                 x2.as_mut_slice(), q.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice(),
                 attn.as_mut_slice(), proj.as_mut_slice(), gate.as_mut_slice(), up.as_mut_slice(),
             );
             self.model.layers = layers;
-            result?;
-        }
+            result
+        };
         self.scratch.x = x;
         self.scratch.x2 = x2;
         self.scratch.q = q;
@@ -753,7 +760,7 @@ impl Engine {
         self.scratch.proj = proj;
         self.scratch.gate = gate;
         self.scratch.up = up;
-        Ok(())
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -762,6 +769,7 @@ impl Engine {
         _ids: &[u32],
         positions: &[usize],
         want_logits: bool,
+        cancellable: bool,
         cfg: &Config,
         b: usize,
         ne: usize,
@@ -785,6 +793,9 @@ impl Engine {
         let scale = 1.0 / (dh as f32).sqrt();
         let ctx = self.n_ctx;
         for (l, lw) in layers.iter().enumerate() {
+            if cancellable && util::stop_requested() {
+                bail!("generation stopped");
+            }
             self.rmsnorm(x, &lw.attn_norm.clone(), b, x2);
             let attn_q = lw.attn_q.clone();
             let attn_k = lw.attn_k.clone();
@@ -920,6 +931,9 @@ impl Engine {
             let _ = (qdim, kdim, ctx);
         }
         if want_logits {
+            if cancellable && util::stop_requested() {
+                bail!("generation stopped");
+            }
             let last = b - 1;
             let outn = self.model.output_norm.clone();
             if let Some(outn) = outn {
@@ -933,6 +947,12 @@ impl Engine {
                 let n_rows = out.ne1;
                 let base = self.model.gguf.file.as_ptr();
                 let ptr = unsafe { base.add(out.off) };
+                let act = if self.int8_enabled && crate::quant_int::supported(out.ttype) {
+                    self.q8.prepare(&normed, out.ne0, 1);
+                    &self.q8 as *const crate::quant_int::Q8Act
+                } else {
+                    core::ptr::null()
+                };
                 self.pool.matmul(
                     out.ttype,
                     ptr,
@@ -942,7 +962,7 @@ impl Engine {
                     1,
                     &mut self.scratch.logits[..n_rows],
                     n_rows,
-                    core::ptr::null(),
+                    act,
                 );
                 if self.dbg_on {
                     self.dbg.push(("result_output", 1, self.scratch.logits[..n_rows].to_vec()));
@@ -1025,27 +1045,39 @@ impl Engine {
         };
         let mut pending: Vec<u8> = Vec::new();
         let mut rng = Rng::new(opts.seed);
-        let mut pos = 0usize;
+        if prompt.is_empty() {
+            bail!("empty prompt");
+        }
         let t0 = std::time::Instant::now();
         let chunk = MAX_BATCH.min(32);
         let mut off = 0usize;
         while off < prompt.len() {
+            if util::stop_requested() {
+                stats.stop = "user_stop".to_string();
+                break;
+            }
             let n = chunk.min(prompt.len() - off);
             let ids = &prompt[off..off + n];
             let positions: Vec<usize> = (off..off + n).collect();
             let last = off + n >= prompt.len();
-            self.forward(ids, &positions, last)?;
+            if let Err(error) = self.forward_inner(ids, &positions, last, true) {
+                if util::stop_requested() {
+                    stats.stop = "user_stop".to_string();
+                    break;
+                }
+                return Err(error);
+            }
             off += n;
         }
-        stats.prefill_tokens = prompt.len();
+        stats.prefill_tokens = off;
         stats.prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        pos = prompt.len();
-        if prompt.is_empty() {
-            bail!("empty prompt");
+        if stats.stop == "user_stop" {
+            return Ok(stats);
         }
+        let mut pos = prompt.len();
         let gen_t0 = std::time::Instant::now();
         let max_gen = opts.max_tokens;
-        for _ in 0..max_gen {
+        for i in 0..max_gen {
             if util::stop_requested() {
                 stats.stop = "user_stop".to_string();
                 break;
@@ -1058,38 +1090,47 @@ impl Engine {
             stats.gen_tokens += 1;
             stats.gen_ids.push(tok);
             pending.extend_from_slice(&self.model.tok.decode_token(tok));
-            flush_utf8(&mut pending, &mut on_text);
+            if !flush_utf8(&mut pending, &mut on_text) {
+                stats.stop = "callback_error".to_string();
+                break;
+            }
+            if i + 1 == max_gen {
+                break;
+            }
             if pos >= self.n_ctx {
                 stats.stop = "context_full".to_string();
                 break;
             }
-            if self.forward(&[tok], &[pos], true).is_err() {
-                stats.stop = "context_full".to_string();
-                break;
+            if let Err(error) = self.forward_inner(&[tok], &[pos], true, true) {
+                if util::stop_requested() {
+                    stats.stop = "user_stop".to_string();
+                    break;
+                }
+                return Err(error);
             }
             pos += 1;
         }
-        if !pending.is_empty() {
+        if !pending.is_empty() && stats.stop != "callback_error" {
             let text = String::from_utf8_lossy(&pending).into_owned();
-            let _ = on_text(text.as_bytes());
+            if !on_text(text.as_bytes()) {
+                stats.stop = "callback_error".to_string();
+            }
         }
         stats.gen_ms = gen_t0.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)
     }
 }
 
-fn flush_utf8(pending: &mut Vec<u8>, on_text: &mut impl FnMut(&[u8]) -> bool) {
+fn flush_utf8(pending: &mut Vec<u8>, on_text: &mut impl FnMut(&[u8]) -> bool) -> bool {
     loop {
         match core::str::from_utf8(pending) {
             Ok(_) => {
                 if !pending.is_empty() {
                     let ok = on_text(pending);
                     pending.clear();
-                    if !ok {
-                        return;
-                    }
+                    return ok;
                 }
-                return;
+                return true;
             }
             Err(e) => {
                 let valid = e.valid_up_to();
@@ -1097,20 +1138,36 @@ fn flush_utf8(pending: &mut Vec<u8>, on_text: &mut impl FnMut(&[u8]) -> bool) {
                     let ok = on_text(&pending[..valid]);
                     pending.drain(..valid);
                     if !ok {
-                        return;
+                        return false;
                     }
                 } else {
                     if let Some(len) = e.error_len() {
                         let ok = on_text("\u{FFFD}".as_bytes());
                         pending.drain(..len);
                         if !ok {
-                            return;
+                            return false;
                         }
                     } else {
-                        return;
+                        return true;
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::flush_utf8;
+
+    #[test]
+    fn callback_failure_aborts_stream() {
+        let mut pending = b"hello".to_vec();
+        let mut calls = 0;
+        assert!(!flush_utf8(&mut pending, &mut |_| {
+            calls += 1;
+            false
+        }));
+        assert_eq!(calls, 1);
     }
 }

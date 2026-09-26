@@ -13,6 +13,7 @@
 - **Memory safety net**: Rust-side signal forensics still writes `native_state.txt`/`native_crash.txt` (phase, op, token counts, backend) so the existing Diagnostics screen keeps working; Rust panics are caught at the JNI boundary and reported instead of killing the app.
 - **New Statistics page**: native library load status, engine capabilities (NEON/int8 dotprod/OpenCL/QNN), loaded model details (architecture, sizes, KV cache, weights by quantization type), a one-tap **health check** that runs file → GGUF → tokenizer → engine load → prefill → sampling on the selected model and reports the exact failing step, engine errors recorded in the run history, plus the previous crash/diagnostics log.
 - **Statistics during generation**: engine details are read on an IO coroutine, and native `engineInfo` returns `busy` immediately while inference holds the model. Opening Stats or copying a report never waits for generation on the UI thread (fixes the Android ANR seen in v0.3.4).
+- **Inference reliability**: Stop now interrupts prompt prefill between transformer layers, callback errors end generation, and scratch buffers survive cancellation for the next request. The final vocabulary projection uses the optimized int8 dot-product kernel. Changing the CPU/GPU preference invalidates the cached backend; OpenCL buffers are released when that backend is dropped.
 
 ### Measured on the reference Snapdragon device (MiniCPM5-2B-Q4_K_M, 4 threads)
 

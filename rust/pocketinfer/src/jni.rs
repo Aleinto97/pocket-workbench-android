@@ -25,7 +25,6 @@ union JValue {
 
 const I_FIND_CLASS: usize = 6;
 const I_THROW_NEW: usize = 14;
-const I_EXCEPTION_CLEAR: usize = 17;
 const I_DELETE_LOCAL_REF: usize = 23;
 const I_GET_OBJECT_CLASS: usize = 31;
 const I_GET_METHOD_ID: usize = 33;
@@ -74,11 +73,6 @@ impl Jni {
     fn exception_check(&self) -> bool {
         let f: extern "C" fn(*mut *const JniTable) -> u8 = self.fn_ptr(I_EXCEPTION_CHECK);
         f(self.env) != 0
-    }
-
-    fn exception_clear(&self) {
-        let f: extern "C" fn(*mut *const JniTable) = self.fn_ptr(I_EXCEPTION_CLEAR);
-        f(self.env);
     }
 
     fn get_object_class(&self, obj: JObject) -> JClass {
@@ -209,6 +203,8 @@ struct Cached {
     path: String,
     n_ctx: usize,
     threads: usize,
+    gpu_requested: bool,
+    gpu_fallback: bool,
     backend: &'static str,
 }
 
@@ -221,6 +217,8 @@ fn cache() -> &'static Mutex<Cached> {
             path: String::new(),
             n_ctx: 0,
             threads: 0,
+            gpu_requested: false,
+            gpu_fallback: false,
             backend: "CPU",
         })
     })
@@ -378,20 +376,24 @@ unsafe fn generate_impl(
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
+    let gpu_requested = use_gpu_j != 0;
     let reload = guard.engine.is_none()
         || guard.path != model_path
         || guard.n_ctx != n_ctx
-        || guard.threads != threads;
+        || guard.threads != threads
+        || guard.gpu_requested != gpu_requested;
     let mut loaded_now = false;
-    let mut gpu_fallback = false;
+    let mut gpu_fallback = guard.gpu_fallback;
     if reload {
         forensics::set_phase(1);
-        match build_engine(&model_path, n_ctx, threads, use_gpu_j != 0) {
+        match build_engine(&model_path, n_ctx, threads, gpu_requested) {
             Ok((engine, backend, fallback)) => {
                 guard.engine = Some(engine);
                 guard.path = model_path.clone();
                 guard.n_ctx = n_ctx;
                 guard.threads = threads;
+                guard.gpu_requested = gpu_requested;
+                guard.gpu_fallback = fallback;
                 guard.backend = backend;
                 gpu_fallback = fallback;
                 loaded_now = true;
@@ -412,7 +414,7 @@ unsafe fn generate_impl(
     } else {
         0.0
     };
-    let backend = guard.backend;
+    let mut backend = guard.backend;
     forensics::set_backend_hint(if backend.starts_with("OpenCL") { "opencl" } else { "cpu" });
     let engine = guard.engine.as_mut().unwrap();
 
@@ -489,6 +491,13 @@ unsafe fn generate_impl(
         }
         true
     });
+    if backend == "OpenCL GPU" && engine.gpu.is_none() {
+        backend = "CPU";
+        gpu_fallback = true;
+        guard.backend = backend;
+        guard.gpu_fallback = true;
+        forensics::set_backend_hint("cpu");
+    }
 
     let stats = match gen_result {
         Ok(s) => s,
@@ -534,9 +543,6 @@ unsafe fn generate_impl(
             j.call_void_method_a(callback, on_stats, &[JValue { l: js }]);
             j.delete_local(js);
         }
-    }
-    if j.exception_check() {
-        j.exception_clear();
     }
     forensics::set_phase(9);
     drop(guard);

@@ -17,6 +17,30 @@ fn main() {
     engine.int8_enabled = std::env::var("POCKET_NO_INT8").is_err();
     eprintln!("load_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
     match mode {
+        "stoptest" => {
+            let prompt = engine.model.tok.encode(&"Ciao ".repeat(120), true);
+            let stop = std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                pocketinfer::util::request_stop();
+            });
+            let opts = GenOpts {
+                n_ctx: 512,
+                max_tokens: 8,
+                temp: 0.0,
+                top_p: 1.0,
+                seed: 1,
+                threads,
+            };
+            let first = engine.generate(&prompt, &opts, |_| true).expect("stopped prefill");
+            stop.join().unwrap();
+            println!("first: stop={} prefill={}/{} tokens", first.stop, first.prefill_tokens, prompt.len());
+            assert_eq!(first.stop, "user_stop");
+            pocketinfer::util::STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            let retry = engine.model.tok.encode("The capital of France is", true);
+            let second = engine.generate(&retry, &opts, |_| true).expect("retry with cached engine");
+            println!("retry: stop={} gen={} first_id={:?}", second.stop, second.gen_tokens, second.gen_ids.first());
+            assert!(second.gen_tokens > 0);
+        }
         "genfile" => {
             let text = std::fs::read_to_string(args.get(3).cloned().unwrap_or_default()).unwrap();
             let ids = engine.model.tok.encode(&text, true);

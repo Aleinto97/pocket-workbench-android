@@ -8,7 +8,7 @@ use std::collections::HashMap;
 extern "C" {
     fn dlopen(filename: *const u8, flags: i32) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const u8) -> *mut c_void;
-    fn dlerror() -> *const u8;
+    fn dlclose(handle: *mut c_void) -> i32;
 }
 
 const RTLD_NOW: i32 = 2;
@@ -26,7 +26,6 @@ type ClKernel = *mut c_void;
 const CL_DEVICE_TYPE_GPU: u64 = 1 << 2;
 const CL_MEM_READ_ONLY: u64 = 1 << 2;
 const CL_MEM_READ_WRITE: u64 = 1 << 0;
-const CL_MEM_USE_HOST_PTR: u64 = 1 << 3;
 const CL_MEM_COPY_HOST_PTR: u64 = 1 << 5;
 const CL_TRUE: u32 = 1;
 
@@ -71,12 +70,18 @@ struct Api {
     enqueue_write_buffer: extern "C" fn(ClQueue, ClMem, u32, usize, usize, *const c_void, ClUint, *const c_void, *mut c_void) -> ClInt,
     finish: extern "C" fn(ClQueue) -> ClInt,
     release_mem_object: extern "C" fn(ClMem) -> ClInt,
+    release_kernel: extern "C" fn(ClKernel) -> ClInt,
+    release_program: extern "C" fn(ClProgram) -> ClInt,
+    release_command_queue: extern "C" fn(ClQueue) -> ClInt,
+    release_context: extern "C" fn(ClContext) -> ClInt,
 }
 
 pub struct OpenClBackend {
     api: Api,
+    lib: *mut c_void,
     ctx: ClContext,
     queue: ClQueue,
+    program: ClProgram,
     device: ClDeviceId,
     kernels: HashMap<u32, ClKernel>,
     weight_buffers: HashMap<(usize, usize), ClMem>,
@@ -289,6 +294,10 @@ impl OpenClBackend {
             enqueue_write_buffer: sym(handle, "clEnqueueWriteBuffer")?,
             finish: sym(handle, "clFinish")?,
             release_mem_object: sym(handle, "clReleaseMemObject")?,
+            release_kernel: sym(handle, "clReleaseKernel")?,
+            release_program: sym(handle, "clReleaseProgram")?,
+            release_command_queue: sym(handle, "clReleaseCommandQueue")?,
+            release_context: sym(handle, "clReleaseContext")?,
         };
         let mut platform = core::ptr::null_mut();
         let mut n = 0u32;
@@ -352,8 +361,10 @@ impl OpenClBackend {
         let device_name = String::from("Adreno OpenCL");
         Ok(Self {
             api,
+            lib: handle,
             ctx,
             queue,
+            program,
             device,
             kernels,
             weight_buffers: HashMap::new(),
@@ -448,15 +459,23 @@ impl OpenClBackend {
         let xbytes = k * 4;
         let obytes = nrows * 4;
         if xbytes > self.x_cap {
-            (self.api.release_mem_object)(self.x_buf);
             let mut err = 0;
-            self.x_buf = (self.api.create_buffer)(self.ctx, CL_MEM_READ_WRITE, xbytes, core::ptr::null_mut(), &mut err);
+            let new_buf = (self.api.create_buffer)(self.ctx, CL_MEM_READ_WRITE, xbytes, core::ptr::null_mut(), &mut err);
+            if new_buf.is_null() || err != 0 {
+                bail!("clCreateBuffer input failed ({err})");
+            }
+            (self.api.release_mem_object)(self.x_buf);
+            self.x_buf = new_buf;
             self.x_cap = xbytes;
         }
         if obytes > self.out_cap {
-            (self.api.release_mem_object)(self.out_buf);
             let mut err = 0;
-            self.out_buf = (self.api.create_buffer)(self.ctx, CL_MEM_READ_WRITE, obytes, core::ptr::null_mut(), &mut err);
+            let new_buf = (self.api.create_buffer)(self.ctx, CL_MEM_READ_WRITE, obytes, core::ptr::null_mut(), &mut err);
+            if new_buf.is_null() || err != 0 {
+                bail!("clCreateBuffer output failed ({err})");
+            }
+            (self.api.release_mem_object)(self.out_buf);
+            self.out_buf = new_buf;
             self.out_cap = obytes;
         }
         let mut err = 0;
@@ -476,6 +495,21 @@ impl OpenClBackend {
             bail!("OpenCL matvec failed ({err})");
         }
         Ok(())
+    }
+}
+
+impl Drop for OpenClBackend {
+    fn drop(&mut self) {
+        self.clear_weight_cache();
+        (self.api.release_mem_object)(self.x_buf);
+        (self.api.release_mem_object)(self.out_buf);
+        for (_, kernel) in self.kernels.drain() {
+            (self.api.release_kernel)(kernel);
+        }
+        (self.api.release_program)(self.program);
+        (self.api.release_command_queue)(self.queue);
+        (self.api.release_context)(self.ctx);
+        unsafe { dlclose(self.lib); }
     }
 }
 

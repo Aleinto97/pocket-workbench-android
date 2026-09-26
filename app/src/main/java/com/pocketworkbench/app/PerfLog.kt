@@ -131,7 +131,7 @@ class PerfLog(private val context: Context) {
             timestamp = System.currentTimeMillis(), model = model,
             backend = stats.optString("backend", "CPU"), threads = stats.optInt("threads", 0),
             loadMs = stats.optDouble("load_ms", 0.0), cached = stats.optInt("model_cached", 0) == 1,
-            gpuFallback = stats.optInt("gpu_fallback", 0) == 1,
+            gpuFallback = stats.optBoolean("gpu_fallback", stats.optInt("gpu_fallback", 0) == 1),
             prefillTokens = stats.optInt("prefill_tokens", 0), prefillMs = stats.optDouble("prefill_ms", 0.0),
             genTokens = stats.optInt("gen_tokens", 0), genMs = stats.optDouble("gen_ms", 0.0),
             stop = stats.optString("stop", "unknown"),
