@@ -141,7 +141,7 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         try {
             val stats = JSONObject().put("backend", "engine-error").put("stop", "error").put("error", msg)
                 .put("ctx", contextTokens).put("threads", genThreads)
-            perf.record(model.name, enriched(stats))
+            perf.record(model.name, enriched(stats.toString()))
         } catch (e: Exception) { Diag.log("stats", "error record FAILED: ${e.message}") }
         buffer.append("\n\n[engine error] ").append(msg)
         refreshEngineInfo()
