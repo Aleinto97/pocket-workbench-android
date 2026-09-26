@@ -18,6 +18,7 @@ android {
             cppFlags += "-std=c++17"
             arguments += listOf("-DGGML_NATIVE=OFF", "-DGGML_OPENMP=OFF", "-DGGML_LLAMAFILE=OFF", "-DLLAMA_OPENSSL=OFF", "-DGGML_VULKAN=${if (providers.gradleProperty("gpu").orNull == "true") "ON" else "OFF"}")
             providers.environmentVariable("SPIRV_HEADERS_CMAKE_DIR").orNull?.let { arguments += "-DSPIRV-Headers_DIR=$it" }
+            providers.environmentVariable("VULKAN_HEADERS_DIR").orNull?.let { arguments += "-DGGML_VULKAN_EXTRA_INCLUDE_DIR=$it" }
         } }
     }
     buildFeatures { compose = true }

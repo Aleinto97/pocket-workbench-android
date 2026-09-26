@@ -22,6 +22,11 @@ build-apk:
     # The Android NDK toolchain hides host CMake packages from find_package().
     - 'export SPIRV_HEADERS_CMAKE_DIR=$(dirname "$(dpkg -L spirv-headers | grep "/SPIRV-HeadersConfig.cmake$" | head -1)")'
     - 'test -f "$SPIRV_HEADERS_CMAKE_DIR/SPIRV-HeadersConfig.cmake"'
+    # The NDK has Vulkan C headers but no Vulkan-Hpp or SPIR-V C++ headers.
+    # Stage only these header trees: do not add the host's entire /usr/include.
+    - mkdir -p "$CI_PROJECT_DIR/build-headers"
+    - cp -a /usr/include/vulkan /usr/include/spirv "$CI_PROJECT_DIR/build-headers/"
+    - export VULKAN_HEADERS_DIR="$CI_PROJECT_DIR/build-headers"
     # --- Android SDK cmdline-tools ---
     - mkdir -p "$ANDROID_HOME/cmdline-tools"
     - curl -sSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"

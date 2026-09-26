@@ -16,7 +16,11 @@ jobs:
       - name: Install Android SDK components
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y glslc libvulkan-dev spirv-headers
+          sudo apt-get install -y ninja-build glslc libvulkan-dev spirv-headers
+          mkdir -p "$GITHUB_WORKSPACE/build-headers"
+          cp -a /usr/include/vulkan /usr/include/spirv "$GITHUB_WORKSPACE/build-headers/"
+          echo "VULKAN_HEADERS_DIR=$GITHUB_WORKSPACE/build-headers" >> "$GITHUB_ENV"
+          echo "SPIRV_HEADERS_CMAKE_DIR=$(dirname "$(dpkg -L spirv-headers | grep '/SPIRV-HeadersConfig.cmake$' | head -1)")" >> "$GITHUB_ENV"
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
       - uses: gradle/actions/setup-gradle@v4
         with:
