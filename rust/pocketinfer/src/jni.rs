@@ -260,6 +260,16 @@ pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_stop(
     util::request_stop();
 }
 
+static PANIC_HOOK: OnceLock<()> = OnceLock::new();
+
+fn install_panic_hook() {
+    PANIC_HOOK.get_or_init(|| {
+        std::panic::set_hook(Box::new(|info| {
+            util::log(util::ANDROID_LOG_ERROR, &format!("engine panic: {info}"));
+        }));
+    });
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_generate(
     env: *mut *const JniTable,
@@ -274,7 +284,31 @@ pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_generate(
     use_gpu_j: u8,
     direct_answer_j: u8,
 ) {
+    install_panic_hook();
     let j = Jni { env };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        generate_impl(
+            &j, path, roles, contents, callback, log_dir, threads_j, context_j, use_gpu_j,
+            direct_answer_j,
+        );
+    }));
+    if result.is_err() && !j.exception_check() {
+        j.throw_state("Native inference engine panicked; generation aborted");
+    }
+}
+
+unsafe fn generate_impl(
+    j: &Jni,
+    path: JString,
+    roles: JArray,
+    contents: JArray,
+    callback: JObject,
+    log_dir: JString,
+    threads_j: i32,
+    context_j: i32,
+    use_gpu_j: u8,
+    direct_answer_j: u8,
+) {
     util::request_stop();
     util::STOP_REQUESTED.store(false, core::sync::atomic::Ordering::SeqCst);
     forensics::GEN_TOKENS.store(0, core::sync::atomic::Ordering::SeqCst);
@@ -400,7 +434,7 @@ pub unsafe extern "C" fn Java_com_pocketworkbench_app_NativeEngine_generate(
         seed: 0xC0FFEE,
         threads,
     };
-    let jref = &j;
+    let jref = j;
     let mut callback_failed = false;
     let gen_result = engine.generate(&tokens, &opts, |bytes| {
         if callback_failed {
