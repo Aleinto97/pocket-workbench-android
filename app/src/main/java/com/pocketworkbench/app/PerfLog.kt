@@ -33,7 +33,9 @@ data class PerfEntry(
     val ttftMs: Double = 0.0,
     val pssMb: Int = 0,
     val thermal: String = "",
-    val foreground: Boolean = true
+    val foreground: Boolean = true,
+    val contextTokens: Int = 4096,
+    val historyDropped: Int = 0
 ) {
     val genTps: Double get() = if (genMs > 0) genTokens / (genMs / 1000.0) else 0.0
     val prefillTps: Double get() = if (prefillMs > 0) prefillTokens / (prefillMs / 1000.0) else 0.0
@@ -55,6 +57,8 @@ data class PerfEntry(
             if (cached) add("model-cached")
             if (!foreground) add("backgrounded")
             if (thermal.isNotBlank() && thermal != "none") add("thermal=$thermal")
+            add("ctx=$contextTokens")
+            if (historyDropped > 0) add("history-trimmed=$historyDropped")
         }.joinToString(",")
         return String.format(Locale.US, "| %s | %s | %s | %s | %.0f | %.1f | %d | %s | %s | %s | %s |",
             time, model.take(28), backend, load, prefillTps, genTps, genTokens, ttft, threads, stop, flags.ifEmpty { "-" })
@@ -102,7 +106,7 @@ class PerfLog(private val context: Context) {
         val issues = mutableListOf<String>()
         if (e.gpuFallback) issues.add("GPU load failed: fell back to CPU")
         when (e.stop) {
-            "context_full" -> issues.add("Context overflow (4096-token window)")
+            "context_full" -> issues.add("Context overflow (${e.contextTokens}-token window)")
             "error" -> issues.add("Inference error during generation")
             "max_tokens" -> issues.add("Reply hit the max-token cap")
             else -> {}
@@ -132,7 +136,9 @@ class PerfLog(private val context: Context) {
             ttftMs = if (stats.has("ttft_ms")) stats.optDouble("ttft_ms", 0.0) else 0.0,
             pssMb = stats.optInt("pss_mb", 0),
             thermal = stats.optString("thermal", ""),
-            foreground = stats.optBoolean("fg", true)
+            foreground = stats.optBoolean("fg", true),
+            contextTokens = stats.optInt("ctx", 4096),
+            historyDropped = stats.optInt("history_dropped", 0)
         )
         val withProblem = entry.copy(problem = detectProblem(entry))
         add(withProblem)
@@ -150,7 +156,8 @@ class PerfLog(private val context: Context) {
                     .put("g_tokens", e.genTokens).put("g_ms", e.genMs).put("stop", e.stop)
                     .put("device", e.deviceModel).put("soc", e.soc).put("android", e.android)
                     .put("ram_total", e.totalRamMb).put("ram_free", e.freeRamMb).put("problem", e.problem)
-                    .put("ttft", e.ttftMs).put("pss", e.pssMb).put("thermal", e.thermal).put("fg", e.foreground))
+                    .put("ttft", e.ttftMs).put("pss", e.pssMb).put("thermal", e.thermal).put("fg", e.foreground)
+                    .put("ctx", e.contextTokens).put("history_dropped", e.historyDropped))
             }
             val temp = File(file.parentFile, "perf_log.tmp")
             temp.writeText(array.toString())
@@ -175,7 +182,8 @@ class PerfLog(private val context: Context) {
                     totalRamMb = o.optLong("ram_total"), freeRamMb = o.optLong("ram_free"),
                     problem = o.optString("problem"),
                     ttftMs = o.optDouble("ttft", 0.0), pssMb = o.optInt("pss", 0),
-                    thermal = o.optString("thermal"), foreground = o.optBoolean("fg", true)
+                    thermal = o.optString("thermal"), foreground = o.optBoolean("fg", true),
+                    contextTokens = o.optInt("ctx", 4096), historyDropped = o.optInt("history_dropped", 0)
                 )
             }.forEach { entries.add(it) }
         } catch (_: Exception) {}
