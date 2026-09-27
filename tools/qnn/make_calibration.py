@@ -5,6 +5,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_DIR, OUTDIR, NSAMPLES = sys.argv[1], sys.argv[2], int(sys.argv[3])
+NO_MASK = "--no-mask" in sys.argv
 B, Q, PAST = 1, 1, 127
 os.makedirs(OUTDIR, exist_ok=True)
 
@@ -34,9 +35,10 @@ for s in range(NSAMPLES):
     last = ids[PAST - 1 + s % 1] if s == 0 else ids[PAST + (s % (len(ids) - PAST))]
     files = {
         "input_ids": np.array([[last]], dtype=np.int64),
-        "attention_mask": np.ones((B, PAST + Q), dtype=np.int64),
         "position_ids": np.array([[PAST]], dtype=np.int64),
     }
+    if not NO_MASK:
+        files["attention_mask"] = np.ones((B, PAST + Q), dtype=np.int64)
     for l in range(LAYERS):
         k, v = step.past_key_values.layers[l].keys, step.past_key_values.layers[l].values
         tag = 2 * l + 1

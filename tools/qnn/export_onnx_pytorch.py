@@ -6,6 +6,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 MODEL_DIR = sys.argv[1]
 OUT = sys.argv[2]
 LAYERS = int(sys.argv[3])
+# For a decode graph (q_len == 1) the causal mask lets the new token see the
+# whole cache, so the padding-mask branch is dead weight. Dropping it also drops
+# the boolean ops (And/Where) that QNN HTP rejects.
+NO_MASK = "--no-mask" in sys.argv
 KEEP = sys.argv[4] if len(sys.argv) > 4 else "q_proj k_proj v_proj o_proj gate_proj up_proj down_proj lm_head"
 
 model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float16)
@@ -25,7 +29,13 @@ class Wrapper(nn.Module):
         self.m = m
         self.n = n_layers
 
-    def forward(self, input_ids, attention_mask, position_ids, *past):
+    def forward(self, *all_args):
+        if NO_MASK:
+            input_ids, position_ids = all_args[0], all_args[1]
+            attention_mask, past = None, all_args[2:]
+        else:
+            input_ids, attention_mask, position_ids = all_args[0], all_args[1], all_args[2]
+            past = all_args[3:]
         cache = DynamicCache()
         for i in range(self.n):
             cache.update(past[2 * i], past[2 * i + 1], i)
@@ -45,6 +55,9 @@ names = ["input_ids", "attention_mask", "position_ids"]
 args = [torch.zeros((B, Q), dtype=torch.long),
         torch.zeros((B, PAST + Q), dtype=torch.long),
         torch.zeros((B, Q), dtype=torch.long)]
+if NO_MASK:
+    names.remove("attention_mask")
+    del args[1]
 hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
 nkv = cfg.num_key_value_heads
 for _ in range(LAYERS):

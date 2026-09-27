@@ -23,5 +23,6 @@ d = snapshot_download(repo_id=repo, allow_patterns=["*.json", "*.safetensors"])
 print("model in", d, flush=True)
 if layers == "0":
     layers = json.load(open(os.path.join(d, "config.json")))["num_hidden_layers"]
-subprocess.check_call([sys.executable, "tools/qnn/export_onnx_pytorch.py", d, out, str(layers)])
+subprocess.check_call([sys.executable, "tools/qnn/export_onnx_pytorch.py",
+                            d, out, str(layers), "--no-mask"])
 PY
