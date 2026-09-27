@@ -65,7 +65,7 @@ build-qnn-context:
       --input_network model.onnx --output_path model.dlc --target_backend HTP $(cat dims.txt)
     # ----------------------------------------------------------- calibrate
     - echo "== 3. calibration data from a real forward pass =="
-    - python3 tools/qnn/make_calibration.py . calib 3 --no-mask
+    - python3 tools/qnn/make_calibration.py model_dir.txt calib 3 --no-mask
     - cat calib/input_list_0.txt calib/input_list_1.txt calib/input_list_2.txt > calib/all.txt
     # ----------------------------------------------------------- quantize
     - echo "== 4. quantize to int8 (HTP needs real quant encodings) =="

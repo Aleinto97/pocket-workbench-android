@@ -4,7 +4,11 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_DIR, OUTDIR, NSAMPLES = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if os.path.isfile(sys.argv[1]):
+    MODEL_DIR = open(sys.argv[1]).read().strip()
+else:
+    MODEL_DIR = sys.argv[1]
+OUTDIR, NSAMPLES = sys.argv[2], int(sys.argv[3])
 NO_MASK = "--no-mask" in sys.argv
 B, Q, PAST = 1, 1, 127
 os.makedirs(OUTDIR, exist_ok=True)

@@ -21,6 +21,7 @@ from huggingface_hub import snapshot_download
 repo, out, layers = sys.argv[1], sys.argv[2], sys.argv[3]
 d = snapshot_download(repo_id=repo, allow_patterns=["*.json", "*.safetensors"])
 print("model in", d, flush=True)
+open("model_dir.txt", "w").write(d + "\n")
 if layers == "0":
     layers = json.load(open(os.path.join(d, "config.json")))["num_hidden_layers"]
 subprocess.check_call([sys.executable, "tools/qnn/export_onnx_pytorch.py",
