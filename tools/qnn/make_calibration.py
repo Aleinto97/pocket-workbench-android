@@ -79,10 +79,12 @@ for s in range(NSAMPLES):
         raise SystemExit("calibration does not match the graph: missing=%s extra=%s"
                          % (missing[:4], extra[:4]))
     lines = []
+    # absolute paths: the quantizer's netrun does not resolve entries relative
+    # to the input list's own directory
     for name, arr in files.items():
         fn = f"s{s}_{qnn_name(name)}.raw"
         arr.tofile(os.path.join(OUTDIR, fn))
-        lines.append(f"{qnn_name(name)}:={fn}")
+        lines.append(f"{qnn_name(name)}:={os.path.join(os.path.abspath(OUTDIR), fn)}")
     with open(os.path.join(OUTDIR, f"input_list_{s}.txt"), "w") as f:
         f.write(" ".join(lines) + "\n")
 print("campioni scritti in", OUTDIR, "| tensori per campione:", len(files))
