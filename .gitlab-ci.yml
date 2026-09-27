@@ -37,6 +37,7 @@ build-qnn-context:
     - echo "== fetch QAIRT SDK (licensed, from private package registry) =="
     - >-
       curl --fail --location --output qairt.zip
+      --header "JOB-TOKEN: ${CI_JOB_TOKEN}"
       "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/qairt-sdk/${QNN_VERSION}/qairt-${QNN_VERSION}.zip"
     - unzip -q qairt.zip
     - SDK="$CI_PROJECT_DIR/qairt/${QNN_VERSION}"
