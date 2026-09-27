@@ -53,12 +53,15 @@ nkv, hd = cfg.num_key_value_heads, getattr(cfg, "head_dim", None) or cfg.hidden_
 
 for s in range(NSAMPLES):
     last = ids[PAST - 1 + s % 1] if s == 0 else ids[PAST + (s % (len(ids) - PAST))]
+    # QAIRT has no int64 tensor type: the converter reports both index inputs as
+    # DataType 0 (FLOAT_32), so the calibration bytes must be float32 or the
+    # netrun rejects them on size.
     files = {
-        "input_ids": np.array([[last]], dtype=np.int64),
-        "position_ids": np.array([[PAST]], dtype=np.int64),
+        "input_ids": np.array([[last]], dtype=np.float32),
+        "position_ids": np.array([[float(PAST)]], dtype=np.float32),
     }
     if not NO_MASK:
-        files["attention_mask"] = np.ones((B, PAST + Q), dtype=np.int64)
+        files["attention_mask"] = np.ones((B, PAST + Q), dtype=np.float32)
     # assign the exported names positionally: the legacy exporter numbers most
     # KV inputs ("past_key.1") but leaves the last pair unnumbered, so deriving
     # the name arithmetically is wrong.
