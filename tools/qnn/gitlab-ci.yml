@@ -60,8 +60,9 @@ build-qnn-context:
       print("nodes", len(m.graph.node), "domains", doms)
       assert doms <= {""}, "only standard ONNX ops are convertible by QAIRT"
       PY
-    - python3 tools/qnn/onnx_qnn_shim.py "$SDK/bin/x86_64-linux-clang/qairt-converter"
-        --input_network model.onnx --output_path model.dlc --target_backend HTP $(cat dims.txt)
+    - >-
+      python3 tools/qnn/onnx_qnn_shim.py "$SDK/bin/x86_64-linux-clang/qairt-converter"
+      --input_network model.onnx --output_path model.dlc --target_backend HTP $(cat dims.txt)
     # ----------------------------------------------------------- calibrate
     - echo "== 3. calibration data from a real forward pass =="
     - python3 tools/qnn/make_calibration.py . calib 3

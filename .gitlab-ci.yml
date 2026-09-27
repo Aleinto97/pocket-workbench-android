@@ -46,31 +46,13 @@ build-qnn-context:
     - export LD_LIBRARY_PATH="$SDK/lib/x86_64-linux-clang"
     # ---------------------------------------------------------------- export
     - echo "== 1. PyTorch -> ONNX (standard ops only, no ORT fusion) =="
-    - |
-      python3 - <<'PY'
-      import os, subprocess, sys
-      from huggingface_hub import snapshot_download
-      d = snapshot_download(repo_id=os.environ["MODEL_REPO"],
-                            allow_patterns=["*.json", "*.safetensors"])
-      print("model in", d)
-      layers = __import__("json").load(open(os.path.join(d, "config.json")))["num_hidden_layers"]
-      subprocess.check_call([sys.executable, "tools/qnn/export_onnx_pytorch.py",
-                             d, "model.onnx", str(layers)])
-      PY
+    - bash tools/qnn/export_model.sh "$MODEL_REPO" model.onnx
     # ------------------------------------------------------------- convert
     - echo "== 2. ONNX -> DLC (HTP) =="
-    - python3 - <<'PY'
-      import onnx
-      m = onnx.load("model.onnx", load_external_data=False)
-      dims = " ".join("-d %s %s" % (i.name, ",".join(str(int(x.dim_value))
-                      for x in i.type.tensor_type.shape.dim)) for i in m.graph.input)
-      open("dims.txt", "w").write(dims)
-      doms = {n.domain for n in m.graph.node}
-      print("nodes", len(m.graph.node), "domains", doms)
-      assert doms <= {""}, "only standard ONNX ops are convertible by QAIRT"
-      PY
-    - python3 tools/qnn/onnx_qnn_shim.py "$SDK/bin/x86_64-linux-clang/qairt-converter"
-        --input_network model.onnx --output_path model.dlc --target_backend HTP $(cat dims.txt)
+    - python3 tools/qnn/make_dims.py model.onnx dims.txt
+    - >-
+      python3 tools/qnn/onnx_qnn_shim.py "$SDK/bin/x86_64-linux-clang/qairt-converter"
+      --input_network model.onnx --output_path model.dlc --target_backend HTP $(cat dims.txt)
     # ----------------------------------------------------------- calibrate
     - echo "== 3. calibration data from a real forward pass =="
     - python3 tools/qnn/make_calibration.py . calib 3
