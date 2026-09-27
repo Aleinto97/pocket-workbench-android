@@ -1,6 +1,7 @@
 import os
 import sys
 import numpy as np
+import onnx
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -12,6 +13,13 @@ OUTDIR, NSAMPLES = sys.argv[2], int(sys.argv[3])
 NO_MASK = "--no-mask" in sys.argv
 B, Q, PAST = 1, 1, 127
 os.makedirs(OUTDIR, exist_ok=True)
+
+# Take the tensor names from the exported graph instead of assuming them: the
+# quantizer's netrun binds calibration files by name, and the DLC may have been
+# renamed during conversion.
+onnx_path = os.environ.get("ONNX_MODEL", "model.onnx")
+graph_inputs = [i.name for i in onnx.load(onnx_path, load_external_data=False).graph.input]
+print("tensori dal grafo:", len(graph_inputs))
 
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float16).eval()
@@ -43,11 +51,25 @@ for s in range(NSAMPLES):
     }
     if not NO_MASK:
         files["attention_mask"] = np.ones((B, PAST + Q), dtype=np.int64)
+    # assign the exported names positionally: the legacy exporter numbers most
+    # KV inputs ("past_key.1") but leaves the last pair unnumbered, so deriving
+    # the name arithmetically is wrong.
+    kv_inputs = [n for n in graph_inputs if n not in ("input_ids", "position_ids", "attention_mask")]
+    if len(kv_inputs) != 2 * LAYERS:
+        raise SystemExit("expected %d KV inputs, graph has %d" % (2 * LAYERS, len(kv_inputs)))
     for l in range(LAYERS):
-        k, v = step.past_key_values.layers[l].keys, step.past_key_values.layers[l].values
-        tag = 2 * l + 1
-        files[f"past_key.{tag}"] = k[0].to(torch.float16).numpy()
-        files[f"past_value.{tag}"] = v[0].to(torch.float16).numpy()
+        k = step.past_key_values.layers[l].keys[0].to(torch.float16).numpy()
+        v = step.past_key_values.layers[l].values[0].to(torch.float16).numpy()
+        name_k, name_v = kv_inputs[2 * l], kv_inputs[2 * l + 1]
+        if "key" not in name_k or "value" not in name_v:
+            raise SystemExit("unexpected KV input order: %s, %s" % (name_k, name_v))
+        files[name_k] = k
+        files[name_v] = v
+    missing = [n for n in graph_inputs if n not in files]
+    extra = [n for n in files if n not in graph_inputs]
+    if missing or extra:
+        raise SystemExit("calibration does not match the graph: missing=%s extra=%s"
+                         % (missing[:4], extra[:4]))
     lines = []
     for name, arr in files.items():
         fn = f"s{s}_{name}.raw"
