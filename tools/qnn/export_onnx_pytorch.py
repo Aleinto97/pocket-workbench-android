@@ -12,7 +12,10 @@ LAYERS = int(sys.argv[3])
 NO_MASK = "--no-mask" in sys.argv
 KEEP = sys.argv[4] if len(sys.argv) > 4 else "q_proj k_proj v_proj o_proj gate_proj up_proj down_proj lm_head"
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.float16)
+# Force eager attention: the ONNX export of scaled_dot_product_attention
+# emulates safe-softmax with IsNaN/Where, which QNN rejects at op validation.
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_DIR, torch_dtype=torch.float16, attn_implementation="eager")
 model.eval()
 cfg = model.config
 print("layers", cfg.num_hidden_layers, "kv heads", cfg.num_key_value_heads,
