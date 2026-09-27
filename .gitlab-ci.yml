@@ -52,7 +52,9 @@ build-qnn-context:
     - python3 tools/qnn/make_dims.py model.onnx dims.txt
     - >-
       python3 tools/qnn/onnx_qnn_shim.py "$SDK/bin/x86_64-linux-clang/qairt-converter"
-      --input_network model.onnx --output_path model.dlc --target_backend HTP $(cat dims.txt)
+      --input_network "$CI_PROJECT_DIR/model.onnx"
+      --output_path "$CI_PROJECT_DIR/model.dlc" --target_backend HTP $(cat dims.txt)
+    - ls -la "$CI_PROJECT_DIR"/*.dlc "$CI_PROJECT_DIR"/*.onnx
     # ----------------------------------------------------------- calibrate
     - echo "== 3. calibration data from a real forward pass =="
     - python3 tools/qnn/make_calibration.py model_dir.txt calib 3 --no-mask
@@ -68,11 +70,12 @@ build-qnn-context:
     - echo "== 5. DLC -> QNN network .so -> hexagon-v81 context binary =="
     - >-
       "$SDK/bin/x86_64-linux-clang/qnn-model-lib-generator"
-      -c model_int8.dlc -o model_int8.so
+      -c "$CI_PROJECT_DIR/model_int8.dlc" -o "$CI_PROJECT_DIR/model_int8.so"
     - >-
       "$SDK/bin/x86_64-linux-clang/qnn-context-binary-generator"
       --backend "$SDK/lib/x86_64-linux-clang/libQairtHtp.so"
-      --model model_int8.so --binary_file model_v81.bin --target_platform hexagon-v81
+      --model "$CI_PROJECT_DIR/model_int8.so"
+      --binary_file "$CI_PROJECT_DIR/model_v81.bin" --target_platform hexagon-v81
     - ls -la model_v81.bin
     - echo "== publish =="
     - >-
