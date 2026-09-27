@@ -45,23 +45,26 @@ print("token di contesto:", len(ids))
 # prefill 127 token, poi un passo di decode: la cache risultante e' una
 # calibrazione realistica per il grafo decode (seq=1, past=127)
 with torch.no_grad():
-    pre = model(input_ids=torch.tensor([ids[:PAST]]), use_cache=True)
-    step = model(input_ids=torch.tensor([ids[PAST:PAST + Q]]),
+    # prefill PAST-1 tokens then one decode step, so the cache holds exactly
+    # PAST positions and matches the graph's past_* extent of 8*127*128
+    pre = model(input_ids=torch.tensor([ids[:PAST - 1]]), use_cache=True)
+    step = model(input_ids=torch.tensor([ids[PAST - 1:PAST - 1 + Q]]),
                  past_key_values=pre.past_key_values, use_cache=True)
 
 nkv, hd = cfg.num_key_value_heads, getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
 
 for s in range(NSAMPLES):
     last = ids[PAST - 1 + s % 1] if s == 0 else ids[PAST + (s % (len(ids) - PAST))]
-    # QAIRT has no int64 tensor type: the converter reports both index inputs as
-    # DataType 0 (FLOAT_32), so the calibration bytes must be float32 or the
-    # netrun rejects them on size.
+    # The DLC, not the ONNX, defines the calibration layout: the converter casts
+    # the int64 index inputs to Int_32 and promotes the fp16 KV cache to
+    # Float_32 (8*127*128*4 = 520192 bytes, which is the extent the netrun
+    # reports expecting). Matching both matters, not just the byte count.
     files = {
-        "input_ids": np.array([[last]], dtype=np.float32),
-        "position_ids": np.array([[float(PAST)]], dtype=np.float32),
+        "input_ids": np.array([[last]], dtype=np.int32),
+        "position_ids": np.array([[PAST]], dtype=np.int32),
     }
     if not NO_MASK:
-        files["attention_mask"] = np.ones((B, PAST + Q), dtype=np.float32)
+        files["attention_mask"] = np.ones((B, PAST + Q), dtype=np.int32)
     # assign the exported names positionally: the legacy exporter numbers most
     # KV inputs ("past_key.1") but leaves the last pair unnumbered, so deriving
     # the name arithmetically is wrong.
@@ -69,8 +72,8 @@ for s in range(NSAMPLES):
     if len(kv_inputs) != 2 * LAYERS:
         raise SystemExit("expected %d KV inputs, graph has %d" % (2 * LAYERS, len(kv_inputs)))
     for l in range(LAYERS):
-        k = step.past_key_values.layers[l].keys[0].to(torch.float16).numpy()
-        v = step.past_key_values.layers[l].values[0].to(torch.float16).numpy()
+        k = step.past_key_values.layers[l].keys[0].to(torch.float32).numpy()
+        v = step.past_key_values.layers[l].values[0].to(torch.float32).numpy()
         name_k, name_v = kv_inputs[2 * l], kv_inputs[2 * l + 1]
         if "key" not in name_k or "value" not in name_v:
             raise SystemExit("unexpected KV input order: %s, %s" % (name_k, name_v))
