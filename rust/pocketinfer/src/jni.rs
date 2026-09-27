@@ -260,7 +260,7 @@ unsafe fn emit_error_stats(
         return;
     }
     let json = format!(
-        "{{\"backend\":\"{}\",\"threads\":{},\"ctx\":{},\"reasoning\":\"{}\",\"load_ms\":0.0,\"model_cached\":1,\"gpu_fallback\":{},\"prefill_tokens\":0,\"prefill_ms\":0.0,\"gen_tokens\":0,\"gen_ms\":0.0,\"history_dropped\":0,\"stop\":\"error\",\"error\":\"{}\"}}",
+        "{{\"backend\":\"{}\",\"threads\":{},\"ctx\":{},\"reasoning\":\"{}\",\"load_ms\":0.0,\"model_cached\":1,\"gpu_fallback\":{},\"prefill_tokens\":0,\"prefill_cached_tokens\":0,\"prefill_ms\":0.0,\"gen_tokens\":0,\"gen_ms\":0.0,\"history_dropped\":0,\"stop\":\"error\",\"error\":\"{}\"}}",
         json_escape_str(backend),
         threads,
         ctx,
@@ -522,11 +522,12 @@ unsafe fn generate_impl(
         let json = format!(
             "{{\"backend\":\"{backend}\",\"threads\":{threads},\"ctx\":{n_ctx},\"reasoning\":\"{}\",\
              \"load_ms\":{load_ms:.1},\"model_cached\":{},\"gpu_fallback\":{gpu_fallback},\
-             \"prefill_tokens\":{},\"prefill_ms\":{:.1},\"gen_tokens\":{},\"gen_ms\":{:.1},\
+             \"prefill_tokens\":{},\"prefill_cached_tokens\":{},\"prefill_ms\":{:.1},\"gen_tokens\":{},\"gen_ms\":{:.1},\
              \"history_dropped\":{dropped},\"stop\":\"{}\"}}",
             if direct_applied { "direct" } else { "automatic" },
             if loaded_now { 0 } else { 1 },
             stats.prefill_tokens,
+            stats.prefill_cached_tokens,
             stats.prefill_ms,
             stats.gen_tokens,
             stats.gen_ms,

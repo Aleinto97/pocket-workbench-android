@@ -21,6 +21,29 @@ fn main() {
     engine.int8_enabled = std::env::var("POCKET_NO_INT8").is_err();
     eprintln!("load_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
     match mode {
+        "prefixcheck" => {
+            let base = args.get(3).cloned().unwrap_or_else(|| "The capital of France is Paris.\n".repeat(16));
+            let addition = args.get(4).cloned().unwrap_or_else(|| "The capital of Germany is Berlin.\n".to_string());
+            let initial = engine.model.tok.encode(&base, true);
+            let extended = engine.model.tok.encode(&(base + &addition), true);
+            assert!(extended.len() < n_ctx, "increase POCKET_CTX for this prompt");
+            let opts = GenOpts { n_ctx, max_tokens: 4, temp: 0.0, top_p: 1.0, seed: 1, threads };
+            let first = engine.generate(&initial, &opts, |_| true).expect("initial prompt");
+            let cached = engine.generate(&extended, &opts, |_| true).expect("cached prompt");
+            let cached_logits = engine.logits().to_vec();
+            let mut fresh = Engine::load(model, n_ctx, threads).expect("fresh engine");
+            fresh.int8_enabled = engine.int8_enabled;
+            let uncached = fresh.generate(&extended, &opts, |_| true).expect("fresh prompt");
+            assert_eq!(cached.gen_ids, uncached.gen_ids, "prefix reuse changed greedy tokens");
+            let max_logit_diff = cached_logits.iter().zip(fresh.logits()).map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_logit_diff < 1e-3, "prefix reuse changed logits: {max_logit_diff}");
+            println!("first: {} eval tokens in {:.1}ms", first.prefill_tokens, first.prefill_ms);
+            println!("second: {} cached + {} eval tokens in {:.1}ms", cached.prefill_cached_tokens, cached.prefill_tokens, cached.prefill_ms);
+            println!("fresh second: {} eval tokens in {:.1}ms", uncached.prefill_tokens, uncached.prefill_ms);
+            println!("maximum logit difference: {max_logit_diff:.6}");
+            println!("identical generated token ids: {:?}", cached.gen_ids);
+        }
         "stoptest" => {
             let prompt = engine.model.tok.encode(&"Ciao ".repeat(120), true);
             let stop = std::thread::spawn(|| {

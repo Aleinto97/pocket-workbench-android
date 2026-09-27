@@ -54,7 +54,7 @@ pub fn inspect(model_path: &str) -> NpuStatus {
     let runtime_lib = candidates.iter().find(|name| loadable(name)).map(|s| s.to_string());
     let blocked = runtime_lib.is_none()
         && candidates.iter().any(|name| Path::new(name).is_file());
-    let description = match (&context_binary, &runtime_lib, blocked) {
+    let mut description = match (&context_binary, &runtime_lib, blocked) {
         (Some(bin), Some(lib), _) => format!(
             "Context {bin} and QNN runtime {lib} detected; QNN execution is not implemented, using CPU/GPU"
         ),
@@ -68,6 +68,9 @@ pub fn inspect(model_path: &str) -> NpuStatus {
             "Vendor QNN library present but inaccessible to the app; QNN execution is not implemented".into(),
         _ => "QNN execution is not implemented; using CPU/GPU".into(),
     };
+    if !fastrpc && Path::new("/vendor/lib64/libcdsprpc.so").is_file() {
+        description.push_str("; FastRPC is present under /vendor but inaccessible to this app");
+    }
     NpuStatus { context_binary, runtime_lib, description, fastrpc, ready: false }
 }
 

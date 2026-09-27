@@ -666,6 +666,7 @@ pub struct GenOpts {
 #[derive(Default, Clone)]
 pub struct GenStats {
     pub prefill_tokens: usize,
+    pub prefill_cached_tokens: usize,
     pub prefill_ms: f64,
     pub gen_tokens: usize,
     pub gen_ms: f64,
@@ -685,6 +686,12 @@ pub struct Engine {
     pub int8_enabled: bool,
     pub dbg_on: bool,
     pub dbg: Vec<(&'static str, usize, Vec<f32>)>,
+    // Token IDs for positions with fully evaluated KV rows in every layer.
+    kv_tokens: Vec<u32>,
+    kv_int8_enabled: bool,
+    // Decode (batch 1) and a short final prefill chunk can round differently
+    // from full 32-token prefill chunks. Only those full chunks are reusable.
+    cached_prefill_len: usize,
 }
 
 impl Engine {
@@ -709,6 +716,9 @@ impl Engine {
             int8_enabled: true,
             dbg_on: false,
             dbg: Vec::new(),
+            kv_tokens: Vec::new(),
+            kv_int8_enabled: true,
+            cached_prefill_len: 0,
         })
     }
 
@@ -813,6 +823,10 @@ impl Engine {
     }
 
     pub fn forward(&mut self, ids: &[u32], positions: &[usize], want_logits: bool) -> Result<()> {
+        // External evaluation can overwrite arbitrary positions; only generate
+        // maintains the exact token-to-KV correspondence needed for reuse.
+        self.kv_tokens.clear();
+        self.cached_prefill_len = 0;
         self.forward_inner(ids, positions, want_logits, false)
     }
 
@@ -1235,7 +1249,23 @@ impl Engine {
         }
         let t0 = std::time::Instant::now();
         let chunk = MAX_BATCH.min(32);
-        let mut off = 0usize;
+        let cpu_only = self.gpu.is_none();
+        if !cpu_only || self.kv_int8_enabled != self.int8_enabled {
+            self.kv_tokens.clear();
+            self.cached_prefill_len = 0;
+        }
+        self.kv_int8_enabled = self.int8_enabled;
+        let common = self.kv_tokens.iter().zip(prompt.iter())
+            .take_while(|(cached, next)| cached == next).count();
+        // Reuse only complete prefill chunks evaluated with batch=32. Decode
+        // tokens and a short final prefill chunk can yield different logits
+        // than evaluating the new prompt from scratch. Always reevaluate at
+        // least the final prompt token (sampling can mutate its logits).
+        let reused = common.min(self.cached_prefill_len).min(prompt.len() - 1) / chunk * chunk;
+        self.kv_tokens.truncate(reused);
+        self.cached_prefill_len = 0;
+        stats.prefill_cached_tokens = reused;
+        let mut off = reused;
         while off < prompt.len() {
             if util::stop_requested() {
                 stats.stop = "user_stop".to_string();
@@ -1246,19 +1276,23 @@ impl Engine {
             let positions: Vec<usize> = (off..off + n).collect();
             let last = off + n >= prompt.len();
             if let Err(error) = self.forward_inner(ids, &positions, last, true) {
+                self.kv_tokens.clear();
                 if util::stop_requested() {
                     stats.stop = "user_stop".to_string();
                     break;
                 }
                 return Err(error);
             }
+            self.kv_tokens.extend_from_slice(ids);
             off += n;
         }
-        stats.prefill_tokens = off;
+        stats.prefill_tokens = off - reused;
         stats.prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if stats.stop == "user_stop" {
+            self.kv_tokens.clear();
             return Ok(stats);
         }
+        self.cached_prefill_len = prompt.len();
         let mut pos = prompt.len();
         let gen_t0 = std::time::Instant::now();
         let max_gen = opts.max_tokens;
@@ -1278,6 +1312,8 @@ impl Engine {
             pending.extend_from_slice(&self.model.tok.decode_token(tok));
             if !flush_utf8(&mut pending, &mut on_text) {
                 stats.stop = "callback_error".to_string();
+                self.kv_tokens.clear();
+                self.cached_prefill_len = 0;
                 break;
             }
             if i + 1 == max_gen {
@@ -1288,19 +1324,28 @@ impl Engine {
                 break;
             }
             if let Err(error) = self.forward_inner(&[tok], &[pos], true, true) {
+                self.kv_tokens.clear();
+                self.cached_prefill_len = 0;
                 if util::stop_requested() {
                     stats.stop = "user_stop".to_string();
                     break;
                 }
                 return Err(error);
             }
+            self.kv_tokens.push(tok);
             pos += 1;
         }
         if !pending.is_empty() && stats.stop != "callback_error" {
             let text = String::from_utf8_lossy(&pending).into_owned();
             if !on_text(text.as_bytes()) {
                 stats.stop = "callback_error".to_string();
+                self.kv_tokens.clear();
+                self.cached_prefill_len = 0;
             }
+        }
+        if !cpu_only || self.gpu.is_some() || stats.stop == "user_stop" {
+            self.kv_tokens.clear();
+            self.cached_prefill_len = 0;
         }
         stats.gen_ms = gen_t0.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)

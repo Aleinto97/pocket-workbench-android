@@ -37,7 +37,8 @@ data class PerfEntry(
     val contextTokens: Int = 4096,
     val historyDropped: Int = 0,
     val reasoning: String = "automatic",
-    val error: String = ""
+    val error: String = "",
+    val prefillCachedTokens: Int = 0
 ) {
     val genTps: Double get() = if (genMs > 0) genTokens / (genMs / 1000.0) else 0.0
     val prefillTps: Double get() = if (prefillMs > 0) prefillTokens / (prefillMs / 1000.0) else 0.0
@@ -45,6 +46,7 @@ data class PerfEntry(
         val parts = mutableListOf<String>()
         if (genTps > 0) parts.add(String.format(Locale.US, "%.1f tok/s", genTps))
         if (genTokens > 0) parts.add("$genTokens tok")
+        if (prefillCachedTokens > 0) parts.add("reuse $prefillCachedTokens tok")
         if (ttftMs > 0) parts.add(String.format(Locale.US, "%.1fs to 1st", ttftMs / 1000.0))
         if (!cached && loadMs > 0) parts.add(String.format(Locale.US, "load %.1fs", loadMs / 1000.0))
         if (parts.isEmpty()) return backend
@@ -58,6 +60,7 @@ data class PerfEntry(
             if (gpuFallback) add("GPU-fallback")
             if (error.isNotBlank()) add("error")
             if (cached) add("model-cached")
+            if (prefillCachedTokens > 0) add("prefix-reused=$prefillCachedTokens")
             if (!foreground) add("backgrounded")
             if (thermal.isNotBlank() && thermal != "none") add("thermal=$thermal")
             add("ctx=$contextTokens")
@@ -133,6 +136,7 @@ class PerfLog(private val context: Context) {
             loadMs = stats.optDouble("load_ms", 0.0), cached = stats.optInt("model_cached", 0) == 1,
             gpuFallback = stats.optBoolean("gpu_fallback", stats.optInt("gpu_fallback", 0) == 1),
             prefillTokens = stats.optInt("prefill_tokens", 0), prefillMs = stats.optDouble("prefill_ms", 0.0),
+            prefillCachedTokens = stats.optInt("prefill_cached_tokens", 0),
             genTokens = stats.optInt("gen_tokens", 0), genMs = stats.optDouble("gen_ms", 0.0),
             stop = stats.optString("stop", "unknown"),
             deviceModel = snap.model, soc = snap.soc, android = snap.android,
@@ -159,7 +163,7 @@ class PerfLog(private val context: Context) {
                 array.put(JSONObject()
                     .put("ts", e.timestamp).put("model", e.model).put("backend", e.backend)
                     .put("threads", e.threads).put("load_ms", e.loadMs).put("cached", e.cached)
-                    .put("gpu_fallback", e.gpuFallback).put("p_tokens", e.prefillTokens).put("p_ms", e.prefillMs)
+                    .put("gpu_fallback", e.gpuFallback).put("p_tokens", e.prefillTokens).put("p_cached", e.prefillCachedTokens).put("p_ms", e.prefillMs)
                     .put("g_tokens", e.genTokens).put("g_ms", e.genMs).put("stop", e.stop)
                     .put("device", e.deviceModel).put("soc", e.soc).put("android", e.android)
                     .put("ram_total", e.totalRamMb).put("ram_free", e.freeRamMb).put("problem", e.problem)
@@ -183,7 +187,7 @@ class PerfLog(private val context: Context) {
                     timestamp = o.getLong("ts"), model = o.getString("model"), backend = o.getString("backend"),
                     threads = o.optInt("threads"), loadMs = o.optDouble("load_ms", 0.0), cached = o.optBoolean("cached"),
                     gpuFallback = o.optBoolean("gpu_fallback"),
-                    prefillTokens = o.optInt("p_tokens"), prefillMs = o.optDouble("p_ms", 0.0),
+                    prefillTokens = o.optInt("p_tokens"), prefillCachedTokens = o.optInt("p_cached"), prefillMs = o.optDouble("p_ms", 0.0),
                     genTokens = o.optInt("g_tokens"), genMs = o.optDouble("g_ms", 0.0),
                     stop = o.optString("stop", "unknown"), deviceModel = o.optString("device"),
                     soc = o.optString("soc"), android = o.optString("android"),

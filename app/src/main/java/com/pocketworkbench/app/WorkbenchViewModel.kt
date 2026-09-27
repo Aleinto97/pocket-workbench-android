@@ -498,9 +498,10 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
         return final.map { it.role }.toTypedArray() to final.map { it.text }.toTypedArray()
     }
 
-    private fun enriched(json: String): JSONObject = try {
+    private fun enriched(json: String, stepTtftMs: Long? = null): JSONObject = try {
         val o = JSONObject(json)
-        if (firstTokenMs > 0) o.put("ttft_ms", firstTokenMs.toDouble())
+        val ttft = stepTtftMs ?: firstTokenMs
+        if (ttft > 0) o.put("ttft_ms", ttft.toDouble())
         o.put("pss_mb", Diag.pssMb())
         o.put("thermal", Diag.thermalName())
         o.put("fg", Diag.foreground)
@@ -546,6 +547,8 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
             val (roles, texts) = withContext(Dispatchers.Main) { modelSnapshot(chatId, replyIndex, includeSystem = true) }
             val buffer = StringBuilder()
             val stepReplyIndex = replyIndex
+            val stepStartMs = SystemClock.elapsedRealtime()
+            var stepFirstTokenMs = 0L
             withContext(Dispatchers.Main) { status = if (step == 0) "Agent: thinking…" else "Agent: step ${step + 1}" }
             Diag.log("agent", "step $step start: replyIndex=$replyIndex promptMsgs=${roles.size} ctx=$contextTokens gpu=$useGpu${if (File(logDir, "vk_safe_mode").exists()) "+vk_safe" else ""}")
             var stepFailed = false
@@ -553,14 +556,18 @@ class WorkbenchViewModel(app: Application): AndroidViewModel(app) {
                 NativeEngine.ensureLoaded()?.let { throw IllegalStateException("Native engine not loaded: $it") }
                 native.generate(model.file.absolutePath, roles, texts, object : NativeEngine.TokenCallback {
                     override fun onToken(piece: String) {
-                        if (firstTokenMs == 0L) { firstTokenMs = SystemClock.elapsedRealtime() - genStartMs; Diag.log("gen", "first token after ${firstTokenMs}ms (incl. any model load)") }
+                        if (stepFirstTokenMs == 0L) {
+                            stepFirstTokenMs = SystemClock.elapsedRealtime() - stepStartMs
+                            Diag.log("gen", "agent step $step first token after ${stepFirstTokenMs}ms")
+                        }
+                        if (firstTokenMs == 0L) firstTokenMs = SystemClock.elapsedRealtime() - genStartMs
                         buffer.append(piece); tokenCount++
                         streamThrottled(chatId, stepReplyIndex, buffer)
                     }
                     override fun onStats(json: String) {
                         nativeGenTokens += try { JSONObject(json).optInt("gen_tokens", 0) } catch (_: Exception) { 0 }
                         Diag.log("stats", "step $step received: $json")
-                        val entry = try { perf.record(model.name, enriched(json)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
+                        val entry = try { perf.record(model.name, enriched(json, stepFirstTokenMs)) } catch (e: Exception) { Diag.log("stats", "record FAILED: ${e.message}"); null }
                         if (entry != null) { lastEntry = entry; viewModelScope.launch(Dispatchers.Main) { liveBackend = entry.backend; attachPerf(chatId, stepReplyIndex, entry.chip()) } }
                     }
                 }, logDir, genThreads, contextTokens, effectiveGpu(), directAnswer)
