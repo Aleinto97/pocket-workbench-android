@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import numpy as np
 import onnx
@@ -17,6 +18,13 @@ os.makedirs(OUTDIR, exist_ok=True)
 # Take the tensor names from the exported graph instead of assuming them: the
 # quantizer's netrun binds calibration files by name, and the DLC may have been
 # renamed during conversion.
+def qnn_name(name):
+    """QAIRT rewrites ONNX tensor names into its own identifier charset:
+    the converter turns "past_key.1" into "past_key_1". The quantizer's netrun
+    binds calibration files by the DLC name, so emit that form."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
 onnx_path = os.environ.get("ONNX_MODEL", "model.onnx")
 graph_inputs = [i.name for i in onnx.load(onnx_path, load_external_data=False).graph.input]
 print("tensori dal grafo:", len(graph_inputs))
@@ -72,9 +80,9 @@ for s in range(NSAMPLES):
                          % (missing[:4], extra[:4]))
     lines = []
     for name, arr in files.items():
-        fn = f"s{s}_{name}.raw"
+        fn = f"s{s}_{qnn_name(name)}.raw"
         arr.tofile(os.path.join(OUTDIR, fn))
-        lines.append(f"{name}:={fn}")
+        lines.append(f"{qnn_name(name)}:={fn}")
     with open(os.path.join(OUTDIR, f"input_list_{s}.txt"), "w") as f:
         f.write(" ".join(lines) + "\n")
 print("campioni scritti in", OUTDIR, "| tensori per campione:", len(files))
