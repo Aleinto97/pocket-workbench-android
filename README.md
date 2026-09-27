@@ -1,26 +1,28 @@
 # Pocket Workbench — Android tablet source project
 
-**Status: engineering preview, not a production-ready app.** This English-language Android app targets Snapdragon-class tablets. The v0.3.0 build replaces the llama.cpp LLM path with a **pure-Rust inference engine** (`rust/pocketinfer`, no external crates) with a CPU NEON/int8 backend, an experimental OpenCL GPU backend and Qualcomm QNN/Hexagon NPU detection. On-device validation of v0.3.0 was performed on the reference Snapdragon device; the APK built by CI still needs a fresh install/QA pass. Native dependencies are fetched during the build; no model or speech weights are bundled.
+**Status: engineering preview.** This Android app targets Snapdragon tablets, including the SM8845P reference device. LLM inference uses a Rust engine with no external Rust crates. CPU inference works; OpenCL is experimental. **NPU inference is not implemented**: QNN/FastRPC information in Stats is diagnostic only. The APK bundles neither model weights nor a QNN runtime.
 
-## Inference engine (v0.3.0)
+## Inference engine
 
-- `rust/pocketinfer` — pure Rust, zero crates.io dependencies (only Rust `std` + raw FFI to Android libc/libOpenCL/QNN). Built as `libpocketinfer.so` by `scripts/build-rust.sh`; Gradle runs the script before `preBuild` and stages the library into `app/build/rustjni/arm64-v8a`.
+- `rust/pocketinfer` — Rust with zero crates.io dependencies (Rust `std` + raw FFI to Android libc/OpenCL; runtime probing uses `dlopen`). Built as `libpocketinfer.so` by `scripts/build-rust.sh`; Gradle runs the script before `preBuild` and stages the library into `app/build/rustjni/arm64-v8a`.
 - **GGUF loader**: metadata v2/v3, tensor table, mmap zero-copy weights, dequant for F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K/Q8_K/Q2_K/Q3_K.
 - **Tokenizer**: exact GPT-2 byte-level BPE with the `minicpm5` (and `gpt-2`, `qwen2`, `llama3`) pre-tokenizer splits, special-token parsing, `MiniCPM5` chat template and the documented direct-answer (`enable_thinking=false`) prefix.
-- **CPU backend**: aarch64 NEON kernels, an int8 `dotprod` path for Q4_K/Q6_K/Q4_0/Q8_0 matmuls, persistent worker pool. Best measured with 4 threads on the reference device.
-- **GPU backend (experimental, off by default)**: Adreno OpenCL via `dlopen` (runtime-compiled kernels, no external shader toolchain). The toggle is off after the first install; when enabled it must pass an on-device self-test against the CPU kernels, and any failure falls back to CPU automatically. A native crash on the GPU path sets a `gpu_safe_mode` marker that keeps OpenCL off until the user re-arms it, mirroring the Vulkan safe mode of v0.2.10.
-- **NPU**: the engine detects a QNN/Hexagon runtime and a `.qnn` context binary next to the GGUF, reports it in Stats, and keeps CPU/GPU until on-device QNN execution lands (see roadmap).
-- **Memory safety net**: Rust-side signal forensics still writes `native_state.txt`/`native_crash.txt` (phase, op, token counts, backend) so the existing Diagnostics screen keeps working; Rust panics are caught at the JNI boundary and reported instead of killing the app.
-- **New Statistics page**: native library load status, engine capabilities (NEON/int8 dotprod/OpenCL/QNN), loaded model details (architecture, sizes, KV cache, weights by quantization type), a one-tap **health check** that runs file → GGUF → tokenizer → engine load → prefill → sampling on the selected model and reports the exact failing step, engine errors recorded in the run history, plus the previous crash/diagnostics log.
-- **Statistics during generation**: engine details are read on an IO coroutine, and native `engineInfo` returns `busy` immediately while inference holds the model. Opening Stats or copying a report never waits for generation on the UI thread (fixes the Android ANR seen in v0.3.4).
-- **Inference reliability**: Stop now interrupts prompt prefill between transformer layers, callback errors end generation, and scratch buffers survive cancellation for the next request. The final vocabulary projection uses the optimized int8 dot-product kernel. Changing the CPU/GPU preference invalidates the cached backend; OpenCL buffers are released when that backend is dropped.
+- **CPU backend**: NEON-accelerated single-token attention and RMSNorm; NEON Q8 activation quantization for decode, dot-product Q4_K/Q6_K/Q4_0/Q8_0 kernels, and a worker pool with row prefetch and a participating caller thread. `f32` KV improves access speed but doubles KV RAM compared with f16. RoPE and SwiGLU remain scalar; there is no i8mm/SME kernel.
+- **GPU backend (experimental, off by default)**: Adreno OpenCL via `dlopen` (runtime-compiled kernels, no external shader toolchain). The toggle is off after the first install; when enabled it must pass an on-device self-test against the CPU kernels, and any failure falls back to CPU automatically. A native crash on the GPU path sets a `gpu_safe_mode` marker that keeps OpenCL off until the user re-arms it.
+- **NPU diagnostics**: reports whether a QNN context file or runtime can be seen; neither is sufficient to execute MiniCPM5. There is no QNN tensor I/O, graph execution, KV-state integration, or hardware validation. Stats never labels CPU tokens as NPU tokens.
+- **Crash diagnostics**: the regular state snapshot records the model/backend; the Android signal handler uses only fixed buffers, atomics and async-signal-safe libc calls to record the signal, phase, operation, backend and token counts. Rust panics are caught at the JNI boundary.
+- **Statistics page**: native library load status, engine capabilities (NEON/int8 dotprod/OpenCL/QNN/FastRPC), loaded model details, a one-tap **health check** (file → GGUF → tokenizer → engine load → prefill → sampling) that reports the exact failing step, engine errors recorded in the run history, plus the previous crash/diagnostics log.
+- **Statistics during generation**: `engineInfo` returns `busy` immediately while inference holds the model (fixes the v0.3.4 ANR).
+- **Inference reliability**: Stop interrupts prefill between layers, callback errors end generation, and scratch buffers survive cancellation. Model load checks tensor shapes against configuration and tokenizer, refuses missing output normalization, and uses checked tensor offsets and sizes. Norm and attention buffers scale with model dimensions; logits are sized from the actual output tensor.
 
-### Measured on the reference Snapdragon device (MiniCPM5-2B-Q4_K_M, 4 threads)
+### Validation on the SM8845P reference device (MiniCPM5-2B-Q4_K_M, GGUF metadata 2.6B)
+
+The Rust CLI produced the same first 16 greedy token IDs as llama.cpp for the raw prompt `The capital of France is`. This is one corpus check, not a proof of numeric parity for every prompt or context. Timings observed in short CLI runs depend on context size, thread count, CPU temperature, memory pressure and warmup; a matched, repeated on-device benchmark is needed before claiming a speedup over llama.cpp or v0.3.5.
+
+For this model the f32 KV cache uses approximately 336 / 672 / 1344 MiB at 4K / 8K / 16K context (f16 used half that). Choose context size with available Android RAM in mind.
 
 - Tokenizer parity with llama.cpp: identical token ids on the test corpus (including digit chunking and `minicpm5` pre-tokenizer).
-- Greedy generation parity with llama.cpp on the real MiniCPM5-2B GGUF: 16/16 identical tokens.
-- Decode ≈ 12.5 tok/s and prefill ≈ 12 tok/s on the CPU backend with 4 threads (release session on the reference tablet; worker pool steals row chunks, int8 `dotprod` keeps weights read once per token). The tablet's own llama.cpp history (v0.2.x) shows 22–28 tok/s CPU at 4K context and up to 26.9 tok/s on the Vulkan build in cool conditions, so the Rust engine is still behind llama.cpp's tuned kernels: the roadmap is i8mm batched GEMM, a **verified** OpenCL GPU path and QNN offload.
-- The engine is validated token-for-token against llama.cpp on the raw-prompt corpus; with the full ChatML chat template the first tokens agree and later greedy tokens can differ only from activation-quantization noise (both engines quantize activations to 8 bit).
+- In one raw-prompt check, 16/16 first greedy token IDs matched llama.cpp (`The capital of France is` → ` Paris.\n- The capital of Germany is`).
 - The OpenCL GPU backend runs a **self-test** (synthetic Q4_K/Q6_K matvec compared against the CPU kernel) before it is used; if the kernels do not match on the device the engine falls back to CPU and Stats reports `gpu_fallback`.
 
 ## Implemented
@@ -35,12 +37,16 @@
 
 ## Gaps against the requested finished app
 
-- **NPU execution is not implemented yet.** The engine can detect the QNN runtime and a context binary, but running MiniCPM5 on the Hexagon NPU requires exporting the model with Qualcomm AI Hub / QAIRT into a QNN context binary and binding the QNN C API on device. Until then the NPU row in Stats is informational only.
+- **NPU execution is not implemented.** The current GGUF Q4_K_M file cannot be passed directly to QNN. An actual NPU backend needs an export compatible with MiniCPM5, QAIRT runtime and version-matched headers, named graph and tensor binding, prefill/decode with persistent KV state, and numerical/performance validation on this tablet. The device's vendor libraries can be inaccessible to Android app processes.
 - **OpenCL GPU path is unverified on hardware.** It compiles, is behind the existing GPU toggle, and any failure falls back to CPU with `gpu_fallback=1` in Stats.
-- **Throughput is below llama.cpp's tuned CPU/Vulkan kernels** (see measurements above): i8mm batched GEMM, async OpenCL pipelining and QNN offload are the roadmap.
+- **Performance versus llama.cpp is not established under controlled conditions.** Further CPU work could include i8mm batched GEMM, lower-overhead long-context attention and matched thermal/memory benchmarks; the OpenCL path also needs real-model validation.
 - **Agent tool loop is not device-tested in this revision.** Small GGUF models may generate malformed calls or stop before writing complete projects. Each turn has a 12-step limit; a command has a 90-second timeout. There is no in-app web preview.
 - Downloads are bound to the app process. Android may terminate them if it kills the process; `.part` files remain for retry. There is no background foreground-service notification, cancellation button, SHA-256 verification against Hub metadata, model quality ranking, or automatic split GGUF handling.
 - A release build should also include profiling, error and memory tests, accessibility checks, background transfer tests, and a privacy/security review.
+
+## Path to Hexagon NPU inference
+
+The QNN row in Stats is informational; this release always generates LLM tokens on CPU or experimental OpenCL. To develop QNN support, first obtain the licensed QAIRT SDK/runtime and a MiniCPM5-compatible model export for the device, including an explicit prefill/decode graph interface and KV-cache state. Then bind the SDK's *actual versioned* API from Rust, pass correctly described tensors, and compare logits and streamed tokens against the CPU implementation on hardware before enabling or reporting `NPU`. Merely placing a `.qnn.bin` alongside a Q4_K_M GGUF does not perform a conversion or offload.
 
 ## Build on a machine with Android Studio
 

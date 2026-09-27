@@ -2,7 +2,7 @@ use crate::gguf::Gguf;
 use crate::quant;
 use crate::sampler::{sample, Rng};
 use crate::tokenizer::Tokenizer;
-use crate::util::{self, f16_to_f32, f32_to_f16, Result};
+use crate::util::{self, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
 use std::sync::atomic::AtomicBool;
@@ -40,6 +40,9 @@ impl Config {
         let n_embd = get("embedding_length")? as usize;
         let n_ff = get("feed_forward_length")? as usize;
         let n_head = get("attention.head_count")? as usize;
+        if n_layer == 0 || n_embd == 0 || n_ff == 0 || n_head == 0 {
+            bail!("invalid model configuration: zero layer, hidden, FFN or head count");
+        }
         let n_head_kv = g
             .get_u64(&format!("{p}.attention.head_count_kv"))
             .unwrap_or(n_head as u64) as usize;
@@ -47,6 +50,14 @@ impl Config {
             .get_u64(&format!("{p}.attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(n_embd / n_head);
+        if head_dim == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 {
+            bail!("invalid GQA configuration: {n_head}/{n_head_kv} with head_dim={head_dim}");
+        }
+        if let Some(value_dim) = g.get_u64(&format!("{p}.attention.value_length")) {
+            if value_dim != head_dim as u64 {
+                bail!("value head dimension {value_dim} differs from key dimension {head_dim}");
+            }
+        }
         let n_rot = g
             .get_u64(&format!("{p}.rope.dimension_count"))
             .map(|v| v as usize)
@@ -62,11 +73,11 @@ impl Config {
             .get_u64(&format!("{p}.vocab_size"))
             .unwrap_or(0) as usize;
         let name = g.get_str_string("general.name").unwrap_or_default();
-        if n_layer == 0 || n_embd == 0 || n_head == 0 || head_dim == 0 {
-            bail!("invalid model configuration");
-        }
-        if n_head_kv == 0 || n_head % n_head_kv != 0 {
-            bail!("invalid GQA configuration: {n_head}/{n_head_kv}");
+        if n_rot == 0 || n_rot > head_dim || n_rot % 2 != 0
+            || !rope_theta.is_finite() || rope_theta <= 0.0
+            || !rms_eps.is_finite() || rms_eps <= 0.0
+        {
+            bail!("invalid RoPE / RMSNorm configuration");
         }
         Ok(Self {
             arch: p,
@@ -147,7 +158,8 @@ impl Pool {
             shutdown: AtomicBool::new(false),
         });
         let mut workers = Vec::new();
-        for _ in 0..if n == 1 { 0 } else { n } {
+        // The calling thread also does row work, so n denotes total threads.
+        for _ in 0..n - 1 {
             let gen = gen.clone();
             let done = done.clone();
             let shared = shared.clone();
@@ -242,7 +254,14 @@ impl Pool {
         out[..n_rows * b].fill(0.0);
         if self.n == 1 {
             for r in 0..n_rows {
-                let row = unsafe { core::slice::from_raw_parts(w.add(r * row_bytes), row_bytes) };
+                let row = unsafe { w.add(r * row_bytes) };
+                if r + 1 < n_rows {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        crate::simd::prefetch_read(row, row_bytes);
+                    }
+                }
+                let row = unsafe { core::slice::from_raw_parts(row, row_bytes) };
                 if !act.is_null() {
                     crate::quant_int::dot_row_q8_lanes(ttype, row, k, unsafe { &*act }, &mut out[r * b..r * b + b], b);
                 } else {
@@ -271,7 +290,32 @@ impl Pool {
         for h in &self.workers {
             h.thread().unpark();
         }
-        while self.done.load(Ordering::Acquire) < self.n {
+        // The calling thread also steals row chunks; workers are the ones that
+        // bump `done` when the queue is exhausted.
+        loop {
+            let start = self.shared.next.fetch_add(chunk, Ordering::Relaxed);
+            if start >= n_rows {
+                break;
+            }
+            let end = (start + chunk).min(n_rows);
+            for r in start..end {
+                let row = unsafe { w.add(r * row_bytes) };
+                if r + 1 < n_rows {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        crate::simd::prefetch_read(row, row_bytes);
+                    }
+                }
+                let row = unsafe { core::slice::from_raw_parts(row, row_bytes) };
+                let dst = &mut out[r * b..r * b + b];
+                if !act.is_null() {
+                    crate::quant_int::dot_row_q8_lanes(ttype, row, k, unsafe { &*act }, dst, b);
+                } else {
+                    quant::row_dot_multi(ttype, row, k, xt, b, dst);
+                }
+            }
+        }
+        while self.done.load(Ordering::Acquire) < self.workers.len() {
             core::hint::spin_loop();
         }
     }
@@ -306,8 +350,8 @@ impl Drop for Pool {
 }
 
 pub struct KvCache {
-    pub k: Vec<u16>,
-    pub v: Vec<u16>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
     pub n_ctx: usize,
     pub n_kv: usize,
     pub dh: usize,
@@ -315,13 +359,30 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    fn new(n_layer: usize, n_kv: usize, n_ctx: usize, dh: usize) -> Self {
-        let n = n_layer * n_kv * n_ctx * dh;
-        Self { k: vec![0u16; n], v: vec![0u16; n], n_ctx, n_kv, dh, n_layer }
+    fn new(n_layer: usize, n_kv: usize, n_ctx: usize, dh: usize) -> Result<Self> {
+        let n = n_layer.checked_mul(n_kv).and_then(|n| n.checked_mul(n_ctx))
+            .and_then(|n| n.checked_mul(dh))
+            .ok_or_else(|| crate::err!("KV cache dimensions overflow"))?;
+        let mut k = Vec::new();
+        let mut v = Vec::new();
+        k.try_reserve_exact(n).map_err(|e| crate::err!("cannot allocate KV keys: {e}"))?;
+        v.try_reserve_exact(n).map_err(|e| crate::err!("cannot allocate KV values: {e}"))?;
+        k.resize(n, 0.0);
+        v.resize(n, 0.0);
+        Ok(Self { k, v, n_ctx, n_kv, dh, n_layer })
     }
     #[inline]
     fn idx(&self, l: usize, h: usize, pos: usize, d: usize) -> usize {
         ((l * self.n_kv + h) * self.n_ctx + pos) * self.dh + d
+    }
+    /// Base pointer of the key row for (layer, kv-head, position).
+    #[inline]
+    fn k_row(&self, l: usize, h: usize, pos: usize) -> *const f32 {
+        &self.k[((l * self.n_kv + h) * self.n_ctx + pos) * self.dh] as *const f32
+    }
+    #[inline]
+    fn v_row(&self, l: usize, h: usize, pos: usize) -> *const f32 {
+        &self.v[((l * self.n_kv + h) * self.n_ctx + pos) * self.dh] as *const f32
     }
 }
 
@@ -333,7 +394,6 @@ pub struct Scratch {
     v: Vec<f32>,
     attn: Vec<f32>,
     proj: Vec<f32>,
-    ffn: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
     row: Vec<f32>,
@@ -341,6 +401,7 @@ pub struct Scratch {
     logits: Vec<f32>,
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
+    rope_inv: Vec<f32>,
     rope_upto: usize,
 }
 
@@ -350,6 +411,13 @@ impl Scratch {
         let qdim = cfg.n_head * cfg.head_dim;
         let kdim = cfg.n_head_kv * cfg.head_dim;
         let half = cfg.n_rot / 2;
+        let mut rope_inv = vec![0.0f32; half.max(1)];
+        for i in 0..half {
+            rope_inv[i] = 1.0 / cfg.rope_theta.powf(2.0 * i as f32 / cfg.n_rot as f32);
+        }
+        // The vocabulary projection writes `output.ne1` rows; size the buffer
+        // from the metadata vocab but never below what the embeddings imply.
+        let n_log = cfg.n_vocab.max(1);
         Self {
             x: vec![0.0; ne * n_batch],
             x2: vec![0.0; ne * n_batch],
@@ -358,23 +426,29 @@ impl Scratch {
             v: vec![0.0; kdim * n_batch],
             attn: vec![0.0; qdim * n_batch],
             proj: vec![0.0; ne * n_batch],
-            ffn: vec![0.0; ne * n_batch],
             gate: vec![0.0; cfg.n_ff * n_batch],
             up: vec![0.0; cfg.n_ff * n_batch],
             row: vec![0.0; ne.max(cfg.n_ff)],
             scores: vec![0.0; n_ctx],
-            logits: vec![0.0; cfg.n_vocab.max(1)],
+            logits: vec![0.0; n_log],
             rope_cos: vec![0.0; n_ctx * half],
             rope_sin: vec![0.0; n_ctx * half],
+            rope_inv,
             rope_upto: 0,
+        }
+    }
+    fn ensure_logits(&mut self, need: usize) {
+        if self.logits.len() < need {
+            self.logits.resize(need, 0.0);
         }
     }
     fn ensure_rope(&mut self, cfg: &Config, upto: usize) {
         let half = (cfg.n_rot / 2).max(1);
         let n = upto.min(self.rope_cos.len() / half);
-        let inv: Vec<f32> = (0..half)
-            .map(|i| 1.0 / cfg.rope_theta.powf(2.0 * i as f32 / cfg.n_rot as f32))
-            .collect();
+        if n <= self.rope_upto {
+            return;
+        }
+        let inv = &self.rope_inv;
         for pos in self.rope_upto..n {
             for i in 0..half {
                 let a = pos as f32 * inv[i];
@@ -382,9 +456,7 @@ impl Scratch {
                 self.rope_sin[pos * half + i] = a.sin();
             }
         }
-        if n > self.rope_upto {
-            self.rope_upto = n;
-        }
+        self.rope_upto = n;
     }
 }
 
@@ -419,22 +491,25 @@ impl Model {
         let base = gguf.data_offset;
         let bytes = gguf.file.as_slice();
         let mut tensors = Vec::new();
-        let mut find = |name: &str| -> Result<TensorRef> {
+        let find = |name: &str| -> Result<TensorRef> {
             let info = gguf
                 .tensor(name)
                 .ok_or_else(|| crate::err!("missing tensor {name}"))?;
             if !quant::is_supported(info.ttype) {
                 bail!("tensor {name}: unsupported type {}", quant::type_name(info.ttype));
             }
-            if info.ne.is_empty() {
-                bail!("tensor {name}: no dims");
+            if info.ne.is_empty() || info.ne.len() > 2 || info.ne.iter().any(|n| *n == 0) {
+                bail!("tensor {name}: expected one or two nonzero dimensions");
             }
-            let ne0 = info.ne[0] as usize;
-            let ne1 = if info.ne.len() >= 2 { info.ne[1] as usize } else { 1 };
+            let ne0 = usize::try_from(info.ne[0]).map_err(|_| crate::err!("tensor {name}: dim0 overflow"))?;
+            let ne1 = if info.ne.len() == 2 {
+                usize::try_from(info.ne[1]).map_err(|_| crate::err!("tensor {name}: dim1 overflow"))?
+            } else { 1 };
             let row_bytes = quant::tensor_nbytes(info.ttype, &[info.ne[0]])?;
-            let off = base + info.offset as usize;
-            let total = row_bytes * ne1;
-            if off + total > bytes.len() {
+            let off = base.checked_add(usize::try_from(info.offset).map_err(|_| crate::err!("tensor {name}: offset overflow"))?)
+                .ok_or_else(|| crate::err!("tensor {name}: offset overflow"))?;
+            let total = row_bytes.checked_mul(ne1).ok_or_else(|| crate::err!("tensor {name}: size overflow"))?;
+            if off.checked_add(total).is_none_or(|end| end > bytes.len()) {
                 bail!("tensor {name}: out of range");
             }
             Ok(TensorRef {
@@ -446,9 +521,13 @@ impl Model {
                 off,
             })
         };
-        let embd = find("token_embd.weight").ok();
-        let output = find("output.weight").ok().or_else(|| embd.clone());
-        let output_norm = find("output_norm.weight").ok();
+        let embd = find("token_embd.weight")?;
+        let output = if gguf.tensor("output.weight").is_some() {
+            Some(find("output.weight")?)
+        } else {
+            Some(embd.clone())
+        };
+        let output_norm = Some(find("output_norm.weight")?);
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for i in 0..cfg.n_layer {
             let l = LayerWeights {
@@ -464,7 +543,6 @@ impl Model {
             };
             layers.push(l);
         }
-        let embd = embd.ok_or_else(|| crate::err!("model has no token_embd.weight"))?;
         tensors.extend(layers.iter().flat_map(|l| {
             vec![
                 l.attn_q.clone(),
@@ -493,11 +571,31 @@ impl Model {
     fn finish(&mut self) -> Result<()> {
         let cfg = &self.cfg;
         let e = self.embd.as_ref().unwrap();
-        if e.ne0 != cfg.n_embd {
-            bail!("embedding dim {} != hidden {}", e.ne0, cfg.n_embd);
+        let vocab = self.tok.n_vocab;
+        if vocab == 0 || e.ne0 != cfg.n_embd || e.ne1 != vocab
+            || (cfg.n_vocab != 0 && cfg.n_vocab != vocab)
+        {
+            bail!("embedding / metadata / tokenizer vocab dimensions disagree");
         }
-        if e.ne1 < cfg.n_vocab.max(1) && cfg.n_vocab != 0 && e.ne1 != cfg.n_vocab {
-            bail!("embedding vocab {} != metadata vocab {}", e.ne1, cfg.n_vocab);
+        let output = self.output.as_ref().unwrap();
+        check_shape(output, cfg.n_embd, vocab)?;
+        check_shape(self.output_norm.as_ref().unwrap(), cfg.n_embd, 1)?;
+        let qdim = cfg.n_head.checked_mul(cfg.head_dim).ok_or_else(|| crate::err!("query dimension overflow"))?;
+        let kdim = cfg.n_head_kv.checked_mul(cfg.head_dim).ok_or_else(|| crate::err!("key dimension overflow"))?;
+        for layer in &self.layers {
+            for (tensor, columns, rows) in [
+                (&layer.attn_norm, cfg.n_embd, 1),
+                (&layer.ffn_norm, cfg.n_embd, 1),
+                (&layer.attn_q, cfg.n_embd, qdim),
+                (&layer.attn_k, cfg.n_embd, kdim),
+                (&layer.attn_v, cfg.n_embd, kdim),
+                (&layer.attn_o, qdim, cfg.n_embd),
+                (&layer.ffn_gate, cfg.n_embd, cfg.n_ff),
+                (&layer.ffn_up, cfg.n_embd, cfg.n_ff),
+                (&layer.ffn_down, cfg.n_ff, cfg.n_embd),
+            ] {
+                check_shape(tensor, columns, rows)?;
+            }
         }
         Ok(())
     }
@@ -549,6 +647,13 @@ impl Model {
     }
 }
 
+fn check_shape(t: &TensorRef, cols: usize, rows: usize) -> Result<()> {
+    if t.ne0 != cols || t.ne1 != rows {
+        bail!("tensor {} has shape {}x{}, expected {}x{}", t.name, t.ne0, t.ne1, cols, rows);
+    }
+    Ok(())
+}
+
 pub struct GenOpts {
     pub n_ctx: usize,
     pub max_tokens: usize,
@@ -590,7 +695,7 @@ impl Engine {
             model.cfg.n_head_kv,
             n_ctx,
             model.cfg.head_dim,
-        );
+        )?;
         let scratch = Scratch::new(&model.cfg, n_ctx, MAX_BATCH);
         let pool = Pool::new(threads);
         Ok(Engine {
@@ -607,27 +712,16 @@ impl Engine {
         })
     }
 
-    fn base(&self) -> &[u8] {
-        self.model.gguf.file.as_slice()
-    }
-
     fn matmul(&mut self, w: &TensorRef, x: &[f32], b: usize, out: &mut [f32]) {
         let base = self.model.gguf.file.as_ptr();
         let ptr = unsafe { base.add(w.off) };
-        if self.int8_enabled && crate::quant_int::supported(w.ttype) {
-            self.q8.prepare(x, w.ne0, b);
-            let act = &self.q8 as *const crate::quant_int::Q8Act;
-            self.pool
-                .matmul(w.ttype, ptr, w.row_bytes, w.ne0, x, b, out, w.ne1, act);
-            return;
-        }
         if b == 1 {
             if let Some(gpu) = self.gpu.as_mut() {
                 if gpu.supports(w.ttype) {
                     let wslice = unsafe {
                         core::slice::from_raw_parts(ptr, w.row_bytes * w.ne1)
                     };
-                    match gpu.matvec(w.ttype, wslice, w.ne0, x, out) {
+                    match gpu.matvec(w.ttype, wslice, w.ne0, &x[..w.ne0], &mut out[..w.ne1]) {
                         Ok(()) => return,
                         Err(e) => {
                             util::log(
@@ -640,12 +734,19 @@ impl Engine {
                 }
             }
         }
+        if self.int8_enabled && crate::quant_int::supported(w.ttype) {
+            self.q8.prepare(x, w.ne0, b);
+            let act = &self.q8 as *const crate::quant_int::Q8Act;
+            self.pool
+                .matmul(w.ttype, ptr, w.row_bytes, w.ne0, x, b, out, w.ne1, act);
+            return;
+        }
         self.pool
             .matmul(w.ttype, ptr, w.row_bytes, w.ne0, x, b, out, w.ne1, core::ptr::null());
     }
 
     pub fn kv_bytes(&self) -> usize {
-        self.kv.k.len() * 2 + self.kv.v.len() * 2
+        self.kv.k.len() * 4 + self.kv.v.len() * 4
     }
 
     pub fn enable_opencl(&mut self) -> Result<()> {
@@ -668,7 +769,36 @@ impl Engine {
         let eps = self.model.cfg.rms_eps;
         let base = self.model.gguf.file.as_slice();
         let wdata = w.data(base);
-        assert_eq!(w.ttype, quant::GGML_TYPE_F32);
+        let mut wbuf = Vec::new();
+        let wptr: *const f32 = if w.ttype == quant::GGML_TYPE_F32
+            && wdata.as_ptr().align_offset(core::mem::align_of::<f32>()) == 0 {
+            wdata.as_ptr() as *const f32
+        } else {
+            wbuf.resize(ne, 0.0);
+            quant::dequant_row(w.ttype, wdata, ne, &mut wbuf);
+            wbuf.as_ptr()
+        };
+        if b == 1 {
+            let ss: f32;
+            #[cfg(target_arch = "aarch64")]
+            { ss = unsafe { crate::simd::f32_sum_sq(x.as_ptr(), ne) }; }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                ss = x[..ne].iter().map(|v| v * v).sum();
+            }
+            let s = 1.0 / (ss / ne as f32 + eps).sqrt();
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                crate::simd::f32_rms_apply(x.as_ptr(), wptr, out.as_mut_ptr(), ne, s);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for i in 0..ne {
+                    out[i] = x[i] * s * unsafe { *wptr.add(i) };
+                }
+            }
+            return;
+        }
         for bi in 0..b {
             let mut ss = 0.0f32;
             for i in 0..ne {
@@ -677,8 +807,7 @@ impl Engine {
             }
             let s = 1.0 / (ss / ne as f32 + eps).sqrt();
             for i in 0..ne {
-                let g = f32::from_le_bytes(wdata[i * 4..i * 4 + 4].try_into().unwrap());
-                out[i * b + bi] = x[i * b + bi] * s * g;
+                out[i * b + bi] = x[i * b + bi] * s * unsafe { *wptr.add(i) };
             }
         }
     }
@@ -787,25 +916,21 @@ impl Engine {
         let group = n_head / n_kv;
         let scale = 1.0 / (dh as f32).sqrt();
         let ctx = self.n_ctx;
+        // Reuse one correctly sized buffer for batched attention. A fixed-size
+        // stack array would overwrite the stack for models with head_dim > 256.
+        #[cfg(target_arch = "aarch64")]
+        let mut local = if b > 1 { vec![0.0f32; dh] } else { Vec::new() };
         for (l, lw) in layers.iter().enumerate() {
             if cancellable && util::stop_requested() {
                 bail!("generation stopped");
             }
-            self.rmsnorm(x, &lw.attn_norm.clone(), b, x2);
-            let attn_q = lw.attn_q.clone();
-            let attn_k = lw.attn_k.clone();
-            let attn_v = lw.attn_v.clone();
-            let attn_o = lw.attn_o.clone();
-            let ffn_gate = lw.ffn_gate.clone();
-            let ffn_up = lw.ffn_up.clone();
-            let ffn_down = lw.ffn_down.clone();
-            let ffn_norm = lw.ffn_norm.clone();
+            self.rmsnorm(x, &lw.attn_norm, b, x2);
             if self.dbg_on && l == 0 {
                 self.dbg.push(("attn_norm-0", b, x2[..ne * b].to_vec()));
             }
-            self.matmul(&attn_q, x2, b, q);
-            self.matmul(&attn_k, x2, b, k);
-            self.matmul(&attn_v, x2, b, v);
+            self.matmul(&lw.attn_q, x2, b, q);
+            self.matmul(&lw.attn_k, x2, b, k);
+            self.matmul(&lw.attn_v, x2, b, v);
             if self.dbg_on && l == 0 {
                 self.dbg.push(("Qcur-0", b, q[..qdim * b].to_vec()));
                 self.dbg.push(("Kcur-0", b, k[..kdim * b].to_vec()));
@@ -844,26 +969,58 @@ impl Engine {
             }
             for (bi, pos) in positions.iter().enumerate() {
                 for h in 0..n_kv {
+                    let base_k = ((l * self.kv.n_kv + h) * self.kv.n_ctx + *pos) * self.kv.dh;
                     for d in 0..dh {
-                        let ki = self.kv.idx(l, h, *pos, d);
-                        self.kv.k[ki] = f32_to_f16(k[(h * dh + d) * b + bi]);
-                        self.kv.v[ki] = f32_to_f16(v[(h * dh + d) * b + bi]);
+                        self.kv.k[base_k + d] = k[(h * dh + d) * b + bi];
+                        self.kv.v[base_k + d] = v[(h * dh + d) * b + bi];
                     }
                 }
             }
             for (bi, pos) in positions.iter().enumerate() {
                 for h in 0..n_head {
                     let kh = h / group;
+                    let qbase = (h * dh) * b + bi;
                     let mut maxs = f32::NEG_INFINITY;
-                    for p in 0..=*pos {
-                        let mut s = 0.0f32;
-                        for d in 0..dh {
-                            s += q[(h * dh + d) * b + bi] * f16_to_f32(self.kv.k[self.kv.idx(l, kh, p, d)]);
+                    if b == 1 {
+                        let qp = &q[qbase..qbase + dh];
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            let mut p = 0usize;
+                            while p <= *pos {
+                                let kr = self.kv.k_row(l, kh, p);
+                                let s = crate::simd::f32_dot(qp.as_ptr(), kr, dh) * scale;
+                                self.scratch.scores[p] = s;
+                                if s > maxs {
+                                    maxs = s;
+                                }
+                                p += 1;
+                            }
                         }
-                        let s = s * scale;
-                        self.scratch.scores[p] = s;
-                        if s > maxs {
-                            maxs = s;
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            for p in 0..=*pos {
+                                let mut s = 0.0f32;
+                                for d in 0..dh {
+                                    s += qp[d] * self.kv.k[self.kv.idx(l, kh, p, d)];
+                                }
+                                let s = s * scale;
+                                self.scratch.scores[p] = s;
+                                if s > maxs {
+                                    maxs = s;
+                                }
+                            }
+                        }
+                    } else {
+                        for p in 0..=*pos {
+                            let mut s = 0.0f32;
+                            for d in 0..dh {
+                                s += q[qbase + d * b] * self.kv.k[self.kv.idx(l, kh, p, d)];
+                            }
+                            let s = s * scale;
+                            self.scratch.scores[p] = s;
+                            if s > maxs {
+                                maxs = s;
+                            }
                         }
                     }
                     let mut sum = 0.0f32;
@@ -873,19 +1030,51 @@ impl Engine {
                         sum += e;
                     }
                     let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-                    for d in 0..dh {
-                        let mut acc = 0.0f32;
-                        for p in 0..=*pos {
-                            acc += self.scratch.scores[p] * f16_to_f32(self.kv.v[self.kv.idx(l, kh, p, d)]);
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        if b == 1 {
+                            let ap = &mut attn[(h * dh)..(h * dh + dh)];
+                            ap.fill(0.0);
+                            for p in 0..=*pos {
+                                let s = self.scratch.scores[p];
+                                if s != 0.0 {
+                                    let vr = self.kv.v_row(l, kh, p);
+                                    crate::simd::f32_axpy(ap.as_mut_ptr(), vr, dh, s);
+                                }
+                            }
+                            for d in 0..dh {
+                                ap[d] *= inv;
+                            }
+                        } else {
+                            local.fill(0.0);
+                            for p in 0..=*pos {
+                                let s = self.scratch.scores[p];
+                                if s != 0.0 {
+                                    let vr = self.kv.v_row(l, kh, p);
+                                    crate::simd::f32_axpy(local.as_mut_ptr(), vr, dh, s);
+                                }
+                            }
+                            for d in 0..dh {
+                                attn[(h * dh + d) * b + bi] = local[d] * inv;
+                            }
                         }
-                        attn[(h * dh + d) * b + bi] = acc * inv;
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for d in 0..dh {
+                            let mut acc = 0.0f32;
+                            for p in 0..=*pos {
+                                acc += self.scratch.scores[p] * self.kv.v[self.kv.idx(l, kh, p, d)];
+                            }
+                            attn[(h * dh + d) * b + bi] = acc * inv;
+                        }
                     }
                 }
             }
             if self.dbg_on && l == 0 {
                 self.dbg.push(("kqv_out-0", b, attn[..qdim * b].to_vec()));
             }
-            self.matmul(&attn_o, attn, b, proj);
+            self.matmul(&lw.attn_o, attn, b, proj);
             if self.dbg_on && l == 0 {
                 self.dbg.push(("attn_out-0", b, proj[..ne * b].to_vec()));
             }
@@ -895,12 +1084,12 @@ impl Engine {
             if self.dbg_on && l == 0 {
                 self.dbg.push(("ffn_inp-0", b, x[..ne * b].to_vec()));
             }
-            self.rmsnorm(x, &ffn_norm, b, x2);
+            self.rmsnorm(x, &lw.ffn_norm, b, x2);
             if self.dbg_on && l == 0 {
                 self.dbg.push(("ffn_norm-0", b, x2[..ne * b].to_vec()));
             }
-            self.matmul(&ffn_gate, x2, b, gate);
-            self.matmul(&ffn_up, x2, b, up);
+            self.matmul(&lw.ffn_gate, x2, b, gate);
+            self.matmul(&lw.ffn_up, x2, b, up);
             if self.dbg_on && l == 0 {
                 self.dbg.push(("ffn_gate-0", b, gate[..cfg.n_ff * b].to_vec()));
                 self.dbg.push(("ffn_up-0", b, up[..cfg.n_ff * b].to_vec()));
@@ -913,7 +1102,7 @@ impl Engine {
             if self.dbg_on && l == 0 {
                 self.dbg.push(("ffn_swiglu-0", b, gate[..cfg.n_ff * b].to_vec()));
             }
-            self.matmul(&ffn_down, gate, b, proj);
+            self.matmul(&lw.ffn_down, gate, b, proj);
             if self.dbg_on && l == 0 {
                 self.dbg.push(("ffn_out-0", b, proj[..ne * b].to_vec()));
             }
@@ -940,6 +1129,7 @@ impl Engine {
                 self.rmsnorm(&last_x, &outn, 1, &mut normed);
                 let out = self.model.output.clone().unwrap();
                 let n_rows = out.ne1;
+                self.scratch.ensure_logits(n_rows.max(self.model.vocab_size()));
                 let base = self.model.gguf.file.as_ptr();
                 let ptr = unsafe { base.add(out.off) };
                 let act = if self.int8_enabled && crate::quant_int::supported(out.ttype) {
@@ -1077,7 +1267,8 @@ impl Engine {
                 stats.stop = "user_stop".to_string();
                 break;
             }
-            let tok = sample(&mut self.scratch.logits[..self.model.vocab_size()], opts.temp, opts.top_p, &mut rng);
+            let nvocab = self.model.vocab_size().min(self.scratch.logits.len());
+            let tok = sample(&mut self.scratch.logits[..nvocab], opts.temp, opts.top_p, &mut rng);
             if self.model.tok.is_eog(tok) {
                 stats.stop = "eog".to_string();
                 break;
@@ -1153,7 +1344,7 @@ fn flush_utf8(pending: &mut Vec<u8>, on_text: &mut impl FnMut(&[u8]) -> bool) ->
 
 #[cfg(test)]
 mod stream_tests {
-    use super::flush_utf8;
+    use super::{check_shape, flush_utf8, KvCache, TensorRef};
 
     #[test]
     fn callback_failure_aborts_stream() {
@@ -1164,5 +1355,19 @@ mod stream_tests {
             false
         }));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn invalid_tensor_shape_is_rejected_before_raw_matmul() {
+        let tensor = TensorRef {
+            name: "blk.0.attn_q.weight".into(), ttype: 0,
+            ne0: 128, ne1: 256, row_bytes: 512, off: 0,
+        };
+        assert!(check_shape(&tensor, 256, 256).is_err());
+    }
+
+    #[test]
+    fn kv_allocation_overflow_returns_error() {
+        assert!(KvCache::new(usize::MAX, 2, 8192, 128).is_err());
     }
 }

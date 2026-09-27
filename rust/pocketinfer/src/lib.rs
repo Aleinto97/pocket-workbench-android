@@ -10,6 +10,8 @@ pub mod quant;
 pub mod quant_int;
 pub mod regexlite;
 pub mod sampler;
+pub mod simd;
+pub mod simd_q8;
 pub mod tokenizer;
 
 pub use model::{Config, Engine, GenOpts, GenStats, Model};

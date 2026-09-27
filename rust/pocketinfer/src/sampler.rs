@@ -52,7 +52,11 @@ pub fn sample(logits: &mut [f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
     }
     if top_p > 0.0 && top_p < 1.0 {
         let mut idx: Vec<u32> = (0..n as u32).collect();
-        idx.sort_unstable_by(|a, b| logits[*b as usize].partial_cmp(&logits[*a as usize]).unwrap());
+        idx.sort_unstable_by(|a, b| {
+            logits[*b as usize]
+                .partial_cmp(&logits[*a as usize])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
         let mut acc = 0.0f32;
         let mut cut = n;
         for (k, i) in idx.iter().enumerate() {

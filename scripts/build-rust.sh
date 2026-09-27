@@ -50,7 +50,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=$sysroot_opt -C link-arg=-L$libdir 
 rustup target add aarch64-linux-android >/dev/null 2>&1 || true
 
 cd "$crate"
-cargo build --release --target aarch64-linux-android
+cargo build --release --lib --target aarch64-linux-android
 mkdir -p "$out_dir"
 cp "$crate/target/aarch64-linux-android/release/libpocketinfer.so" "$out_dir/"
 echo "staged: $out_dir/libpocketinfer.so"

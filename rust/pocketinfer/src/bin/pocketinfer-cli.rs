@@ -13,7 +13,11 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4usize);
-    let mut engine = Engine::load(model, 512, threads).expect("load");
+    let n_ctx = std::env::var("POCKET_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512usize);
+    let mut engine = Engine::load(model, n_ctx, threads).expect("load");
     engine.int8_enabled = std::env::var("POCKET_NO_INT8").is_err();
     eprintln!("load_ms={:.1}", t0.elapsed().as_secs_f64() * 1000.0);
     match mode {
@@ -24,7 +28,7 @@ fn main() {
                 pocketinfer::util::request_stop();
             });
             let opts = GenOpts {
-                n_ctx: 512,
+                n_ctx,
                 max_tokens: 8,
                 temp: 0.0,
                 top_p: 1.0,
@@ -46,7 +50,7 @@ fn main() {
             let ids = engine.model.tok.encode(&text, true);
             eprintln!("ids={ids:?}");
             let opts = GenOpts {
-                n_ctx: 512,
+                n_ctx,
                 max_tokens: args.get(4).and_then(|v| v.parse().ok()).unwrap_or(8),
                 temp: 0.0,
                 top_p: 1.0,
@@ -109,7 +113,7 @@ fn main() {
             let ids = engine.model.tok.encode(&text, true);
             eprintln!("ids={ids:?}");
             let opts = GenOpts {
-                n_ctx: 512,
+                n_ctx,
                 max_tokens: args.get(4).and_then(|v| v.parse().ok()).unwrap_or(8),
                 temp: 0.0,
                 top_p: 1.0,
@@ -189,7 +193,7 @@ fn main() {
             let ids = engine.model.tok.encode(&prompt, true);
             eprintln!("prompt_tokens={}", ids.len());
             let opts = GenOpts {
-                n_ctx: 512,
+                n_ctx,
                 max_tokens: n,
                 temp,
                 top_p: 0.95,
@@ -213,7 +217,7 @@ fn main() {
             let ids = engine.model.tok.encode(&text, true);
             eprintln!("prompt_tokens={ids:?}");
             let opts = GenOpts {
-                n_ctx: 512,
+                n_ctx,
                 max_tokens: args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8),
                 temp: args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0),
                 top_p: 1.0,

@@ -12,7 +12,7 @@ type JString = *mut c_void;
 type JArray = *mut c_void;
 
 #[repr(C)]
-struct JniTable {
+pub struct JniTable {
     entries: [usize; 233],
 }
 
@@ -235,16 +235,11 @@ unsafe fn build_engine(
     let mut fallback = false;
     if use_gpu {
         match engine.enable_opencl() {
-            Ok(()) => {
-                backend = "OpenCL GPU";
-            }
+            Ok(()) => backend = "OpenCL GPU+CPU",
             Err(e) => {
                 util::log(util::ANDROID_LOG_WARN, &format!("OpenCL unavailable: {e}"));
                 fallback = true;
             }
-        }
-        if let Err(e) = engine.enable_npu(model_path) {
-            util::log(util::ANDROID_LOG_INFO, &format!("NPU: {e}"));
         }
     }
     Ok((engine, backend, fallback))
@@ -426,7 +421,7 @@ unsafe fn generate_impl(
     forensics::set_phase(3);
     let mut kept: Vec<usize> = (0..messages.len()).collect();
     let mut prompt;
-    let mut direct_applied = false;
+    let mut direct_applied: bool;
     let mut tokens;
     loop {
         let view: Vec<Message> = kept.iter().map(|i| messages[*i].clone()).collect();
@@ -588,8 +583,6 @@ fn engine_info_json() -> String {
         Some(lib) => caps.push_str(&format!(",\"opencl\":\"{}\"", json_escape_str(&lib))),
         None => caps.push_str(",\"opencl\":null"),
     }
-    let npu = crate::backend::npu::inspect("");
-    caps.push_str(&format!(",\"qnn\":\"{}\"", json_escape_str(&npu.description)));
     let mut model = "null".to_string();
     let guard = match cache().try_lock() {
         Ok(guard) => Some(guard),
@@ -597,6 +590,15 @@ fn engine_info_json() -> String {
         Err(std::sync::TryLockError::WouldBlock) => None,
     };
     let busy = guard.is_none();
+    let model_path = guard.as_ref().map(|g| g.path.clone()).unwrap_or_default();
+    let npu = crate::backend::npu::inspect(&model_path);
+    caps.push_str(&format!(",\"qnn\":\"{}\"", json_escape_str(&npu.description)));
+    caps.push_str(&format!(
+        ",\"qnn_ready\":{},\"fastrpc\":{},\"npu_backend\":{}",
+        npu.ready,
+        npu.fastrpc,
+        npu.ready
+    ));
     if let Some(guard) = guard {
         if let Some(engine) = guard.engine.as_ref() {
             let cfg = &engine.model.cfg;

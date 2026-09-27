@@ -61,13 +61,14 @@ pub fn tensor_nbytes(ttype: u32, ne: &[u64]) -> Result<usize> {
     let (be, bb) = type_block(ttype).ok_or_else(|| crate::err!("unsupported tensor type {}", ttype))?;
     let mut n = 1u64;
     for (i, d) in ne.iter().enumerate() {
-        if i == 0 && (*d as usize) % be != 0 {
+        if i == 0 && *d % be as u64 != 0 {
             bail!("dim0 {d} not divisible by block {be}");
         }
-        n = n.saturating_mul(*d);
+        n = n.checked_mul(*d).ok_or_else(|| crate::err!("tensor element count overflow"))?;
     }
     let blocks = n / be as u64;
-    Ok((blocks as usize).saturating_mul(bb))
+    usize::try_from(blocks).ok().and_then(|n| n.checked_mul(bb))
+        .ok_or_else(|| crate::err!("tensor byte size overflow"))
 }
 
 #[inline]
@@ -717,4 +718,14 @@ pub mod neon {
 
 pub fn is_supported(ttype: u32) -> bool {
     type_block(ttype).is_some()
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::{tensor_nbytes, GGML_TYPE_F32};
+
+    #[test]
+    fn oversized_tensor_is_rejected_instead_of_saturating() {
+        assert!(tensor_nbytes(GGML_TYPE_F32, &[u64::MAX, u64::MAX]).is_err());
+    }
 }

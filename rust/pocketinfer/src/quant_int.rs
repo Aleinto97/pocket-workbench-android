@@ -24,6 +24,12 @@ impl Q8Act {
             self.b = b;
             self.nb = nb;
         }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            if b == 1 {
+                return crate::simd_q8::prepare_lane0(x, k, nb, &mut self.q, &mut self.d, &mut self.sum);
+            }
+        }
         for bi in 0..b {
             for blk in 0..nb {
                 let base = blk * 32;

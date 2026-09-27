@@ -108,7 +108,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
         let payload = if mant != 0 { 0x200 | (mant >> 13) as u16 } else { 0 };
         return sign | 0x7C00 | payload;
     }
-    let mut e = exp - 127 + 15;
+    let e = exp - 127 + 15;
     if e >= 0x1F {
         return sign | 0x7C00;
     }
@@ -134,7 +134,6 @@ pub fn f32_to_f16(v: f32) -> u16 {
             return sign | 0x7C00;
         }
     }
-    e = ((half >> 10) & 0x1F) as i32;
     sign | half
 }
 

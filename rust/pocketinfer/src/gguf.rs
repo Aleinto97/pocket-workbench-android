@@ -48,7 +48,7 @@ impl<'a> Reader<'a> {
         Self { b, o: 0 }
     }
     fn need(&self, n: usize) -> Result<()> {
-        if self.o + n > self.b.len() {
+        if n > self.b.len().saturating_sub(self.o) {
             bail!("gguf truncated at offset {}", self.o);
         }
         Ok(())
@@ -183,7 +183,11 @@ impl Gguf {
             _ => 32,
         };
         let alignment = alignment.max(1);
-        let data_offset = (r.o + alignment - 1) / alignment * alignment;
+        let data_offset = r.o.checked_add(alignment - 1)
+            .ok_or_else(|| crate::err!("invalid GGUF alignment"))? / alignment * alignment;
+        if data_offset > bytes.len() {
+            bail!("GGUF tensor data begins past the end of the file");
+        }
         Ok(Self { file, version, tensors, data_offset, kv, order })
     }
 
@@ -317,15 +321,18 @@ impl Gguf {
 
     pub fn tensor_data<'a>(&'a self, info: &TensorInfo) -> Result<&'a [u8]> {
         let bytes = self.file.as_slice();
-        let start = self.data_offset + info.offset as usize;
+        let start = usize::try_from(info.offset).ok()
+            .and_then(|offset| self.data_offset.checked_add(offset))
+            .ok_or_else(|| crate::err!("tensor {} offset overflow", info.name))?;
         if start > bytes.len() {
             bail!("tensor {} outside file", info.name);
         }
         let n = crate::quant::tensor_nbytes(info.ttype, &info.ne)?;
-        if start + n > bytes.len() {
+        let end = start.checked_add(n).ok_or_else(|| crate::err!("tensor {} size overflow", info.name))?;
+        if end > bytes.len() {
             bail!("tensor {} truncated (need {n} bytes)", info.name);
         }
-        Ok(&bytes[start..start + n])
+        Ok(&bytes[start..end])
     }
 }
 
