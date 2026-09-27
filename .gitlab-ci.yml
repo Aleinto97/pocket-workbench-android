@@ -54,7 +54,15 @@ build-qnn-context:
       python3 tools/qnn/onnx_qnn_shim.py "$SDK/bin/x86_64-linux-clang/qairt-converter"
       --input_network "$CI_PROJECT_DIR/model.onnx"
       --output_path "$CI_PROJECT_DIR/model.dlc" --target_backend HTP $(cat dims.txt)
-    - ls -la "$CI_PROJECT_DIR"/*.dlc "$CI_PROJECT_DIR"/*.onnx
+    - df -h "$CI_PROJECT_DIR"
+    - ls -la "$CI_PROJECT_DIR"
+    - |
+      test -s "$CI_PROJECT_DIR/model.dlc" || {
+        echo "FATAL: converter reported success but model.dlc is missing"
+        find "$CI_PROJECT_DIR" -maxdepth 2 -name "*.dlc" -o -maxdepth 2 -name "*.bin" | head
+        exit 1
+      }
+      ls -la "$CI_PROJECT_DIR/model.dlc"
     # ----------------------------------------------------------- calibrate
     - echo "== 3. calibration data from a real forward pass =="
     - python3 tools/qnn/make_calibration.py model_dir.txt calib 3 --no-mask
