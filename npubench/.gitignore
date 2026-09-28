@@ -1,0 +1,4 @@
+# Fetched by scripts/fetch-geniex.sh from the private dataset: BSD-3 binaries,
+# but not ours to commit.
+src/main/jniLibs/
+src/main/assets/geniex-bench

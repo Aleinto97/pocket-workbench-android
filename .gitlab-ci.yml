@@ -104,6 +104,38 @@ build-qnn-context:
     expire_in: 30 days
     when: always
 
+# Builds the NPU measurement app. The GenieX llama.cpp runtime is BSD-3 but is
+# fetched from the private dataset rather than committed, so this job needs the
+# HF_TOKEN secret; the measurement itself runs on the device.
+build-npubench:
+  stage: build
+  image: eclipse-temurin:17-jdk-noble
+  timeout: 60m
+  variables:
+    ANDROID_HOME: "$CI_PROJECT_DIR/android-sdk"
+    GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle-home"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+    - mkdir -p "$ANDROID_HOME/cmdline-tools"
+    - curl -sSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+    - unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+    - mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+    - yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+    - $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+    - curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.11.1-bin.zip
+    - unzip -q /tmp/gradle.zip -d /opt
+    - export PATH="/opt/gradle-8.11.1/bin:$PATH"
+    - test -n "$HF_TOKEN" || { echo "FATAL: HF_TOKEN secret missing"; exit 1; }
+    - bash scripts/fetch-geniex.sh
+  script:
+    - gradle :npubench:assembleRelease --no-daemon --stacktrace
+    - cp npubench/build/outputs/apk/release/*.apk NpuBench.apk
+    - ls -la NpuBench.apk
+  artifacts:
+    paths:
+      - NpuBench.apk
+    expire_in: 30 days
+
 build-apk:
   stage: build
   timeout: 90m
