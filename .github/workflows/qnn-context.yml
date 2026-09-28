@@ -131,23 +131,26 @@ jobs:
           ls -la "$GITHUB_WORKSPACE/model_int8.dlc"
           rm -f "$GITHUB_WORKSPACE/model.dlc"
 
-      - name: DLC to QNN network to hexagon-v81 context binary
+      - name: Try the offline .so path for a context binary
         run: |
           set -euo pipefail
-          "$SDKROOT/bin/x86_64-linux-clang/qnn-model-lib-generator" \
-            -c "$GITHUB_WORKSPACE/model_int8.dlc" -o "$GITHUB_WORKSPACE/model_int8.so"
-          "$SDKROOT/bin/x86_64-linux-clang/qnn-context-binary-generator" \
-            --backend "$SDKROOT/lib/x86_64-linux-clang/libQairtHtp.so" \
-            --model "$GITHUB_WORKSPACE/model_int8.so" \
-            --binary_file "$GITHUB_WORKSPACE/model_v81.bin" \
-            --target_platform hexagon-v81
-          test -s "$GITHUB_WORKSPACE/model_v81.bin" || { echo "FATAL: no context binary"; exit 1; }
-          ls -la "$GITHUB_WORKSPACE/model_v81.bin"
-          sha256sum "$GITHUB_WORKSPACE/model_v81.bin"
+          # qnn-model-lib-generator wants a .cpp/.bin pair from a CPP export, not a
+          # DLC, so the offline .so path is not applicable to a quantized DLC.
+          # The device path (qairt-dlc-prepare) handles the DLC directly and is
+          # the one that was verified against real hardware.
+          echo "skipping qnn-model-lib-generator: needs a .cpp export, not a DLC"
+          echo "the int8 DLC is the deliverable; qairt-dlc-prepare turns it into a V81 context binary on device"
 
-      - name: Upload the context binary
+      - name: Report the deliverable
+        run: |
+          set -euo pipefail
+          test -s "$GITHUB_WORKSPACE/model_int8.dlc" || { echo "FATAL: no int8 DLC"; exit 1; }
+          ls -la "$GITHUB_WORKSPACE/model_int8.dlc"
+          sha256sum "$GITHUB_WORKSPACE/model_int8.dlc"
+
+      - name: Upload the quantized DLC
         uses: actions/upload-artifact@v4
         with:
-          name: qnn-context-${{ github.run_number }}
-          path: model_v81.bin
+          name: qnn-int8-dlc-${{ github.run_number }}
+          path: model_int8.dlc
           retention-days: 30
