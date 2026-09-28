@@ -86,6 +86,8 @@ jobs:
             "qairt/${QNN_VERSION}/lib/hexagon-v81/*" \
             -d sdkroot
           rm -f qairt.zip
+          # hf_hub_download keeps its own copy; that is another 2.6 GB we do not need
+          rm -rf "${HF_HOME:-$HOME/.cache/huggingface}"
           df -h .
           echo "SDKROOT=$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}/lib/x86_64-linux-clang" >> "$GITHUB_ENV"
@@ -106,14 +108,15 @@ jobs:
             --target_backend HTP $(cat dims.txt)
           test -s "$GITHUB_WORKSPACE/model.dlc" || { echo "FATAL: no DLC after conversion"; exit 1; }
           ls -la "$GITHUB_WORKSPACE/model.dlc"
-          # the fp16 ONNX is 1.6 GB and the DLC 2.9 GB; free the former now
-          rm -f "$GITHUB_WORKSPACE/model.onnx"
+          # model.onnx stays until calibration has read the tensor names from it
 
       - name: Calibration from a real forward pass
         run: |
           set -euo pipefail
           python3 tools/qnn/make_calibration.py model_dir.txt calib 3 --no-mask
           cat calib/input_list_0.txt calib/input_list_1.txt calib/input_list_2.txt > calib/all.txt
+          # the fp16 ONNX is 1.6 GB and the DLC 2.9 GB; free the former now
+          rm -f "$GITHUB_WORKSPACE/model.onnx"
           df -h .
 
       - name: Quantize to int8
