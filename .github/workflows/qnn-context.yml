@@ -51,7 +51,6 @@ jobs:
             --index-url https://download.pytorch.org/whl/cpu torch
           python3 -m pip install --quiet --target /tmp/qnn-home \
             transformers onnx numpy onnxruntime pyyaml packaging setuptools
-          echo "PYTHONPATH=/tmp/qnn-home" >> "$GITHUB_ENV"
 
       - name: Fetch the QAIRT SDK
         env:
@@ -90,6 +89,8 @@ jobs:
           df -h .
           echo "SDKROOT=$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}/lib/x86_64-linux-clang" >> "$GITHUB_ENV"
+          # the QAIRT converters import the qti package from the SDK itself
+          echo "PYTHONPATH=/tmp/qnn-home:$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}/lib/python" >> "$GITHUB_ENV"
 
       - name: Export the model to ONNX with standard ops only
         run: bash tools/qnn/export_model.sh "$MODEL_REPO" model.onnx
