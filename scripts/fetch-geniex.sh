@@ -11,7 +11,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 mod="$root/npubench"
 libs="$mod/src/main/jniLibs/arm64-v8a"
 assets="$mod/src/main/assets"
-tarball="${TARBALL:-/tmp/opencode/gx/geniex-llamacpp-arm64.tar.gz}"
+# keep the download inside a directory that exists on both the workstation and CI
+tarball="${TARBALL:-${TMPDIR:-/tmp}/geniex-llamacpp-arm64.tar.gz}"
 hf_repo="${HF_REPO:-Aleinto/qairt-sdk}"
 hf_file="${HF_FILE:-geniex-llamacpp-arm64.tar.gz}"
 
