@@ -1,0 +1,58 @@
+name: npubench-apk
+
+# Build the NPU measurement app.
+#
+# It has to be a real APK: the ggml-hexagon backend asks RPCCode for an
+# absolute skel URI that is resolved against the calling process's native
+# library directory, which only exists for an installed app. From adb shell
+# the session fails with 0x80000406.
+on:
+  push:
+    branches: [main]
+    paths: ['npubench/**', 'scripts/fetch-geniex.sh', '.github/workflows/npubench-apk.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: npubench-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up the Android SDK and Gradle
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+          curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.11.1-bin.zip
+          unzip -q /tmp/gradle.zip -d /opt
+          echo "/opt/gradle-8.11.1/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the GenieX runtime
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$HF_TOKEN" || { echo "FATAL: HF_TOKEN secret is not set"; exit 1; }
+          bash scripts/fetch-geniex.sh
+          ls -la npubench/src/main/jniLibs/arm64-v8a | tail -3
+          ls -la npubench/src/main/assets
+
+      - name: Build the APK
+        run: gradle :npubench:assembleRelease --no-daemon --stacktrace
+
+      - name: Report the APK
+        run: |
+          ls -la npubench/build/outputs/apk/release/*.apk
+          du -h npubench/build/outputs/apk/release/*.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npubench-apk
+          path: npubench/build/outputs/apk/release/*.apk
+          retention-days: 30
