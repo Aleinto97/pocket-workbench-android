@@ -59,11 +59,16 @@ jobs:
         run: |
           set -euo pipefail
           # fail loudly rather than silently produce an image without the SDK
-          test -n "$HF_TOKEN" || {
-            echo "FATAL: secret HF_TOKEN is not set. The QAIRT SDK is licensed"
-            echo "material and is not in this repository by design."
+          if [ -z "$HF_TOKEN" ]; then
+            echo "FATAL: secret HF_TOKEN is empty for this run."
+            echo "The QAIRT SDK is licensed material and is not in this repo by design."
+            echo "Check: Settings > Secrets and variables > Actions > Repository secrets,"
+            echo "a secret named exactly HF_TOKEN (case sensitive), not under Environment"
+            echo "secrets; the value must start with hf_ and have no trailing newline."
+            echo "If it was created after this run started, re-run the workflow."
             exit 1
-          }
+          fi
+          echo "HF_TOKEN present (${#HF_TOKEN} chars)"
           python3 -m pip install --quiet huggingface_hub
           python3 - <<'PY'
           import os, shutil
