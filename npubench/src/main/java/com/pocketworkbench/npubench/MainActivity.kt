@@ -63,7 +63,6 @@ class MainActivity : Activity() {
                 say("ABORT: benchmark executable missing from assets")
                 return
             }
-            say("bench: ${bench.absolutePath} executable=${bench.canExecute()}")
 
             val model = findModel() ?: return
 
@@ -86,13 +85,18 @@ class MainActivity : Activity() {
     /**
      * The benchmark is an ELF program, not a shared library, so Android will
      * not extract it from jniLibs; copy it out of the assets instead.
+     *
+     * It must land in the internal cache: externalCacheDir lives on the
+     * /storage/emulated FUSE mount, which is noexec, so exec fails with
+     * EACCES whatever mode the file carries.
      */
     private fun extractBench(): File? {
-        val out = File(externalCacheDir ?: cacheDir, BENCH)
+        val out = File(cacheDir, BENCH)
         if (!out.exists() || out.length() == 0L) {
             assets.open(BENCH).use { input -> out.outputStream().use { input.copyTo(it) } }
         }
         out.setExecutable(true, true)
+        say("bench: ${out.absolutePath} executable=${out.canExecute()}")
         return out
     }
 
