@@ -1,0 +1,137 @@
+name: qnn-context
+
+# Build a QNN/Hexagon context binary for the Snapdragon 8 Elite Gen 5 (Hexagon V81).
+#
+# Why this runs in CI and not on an ARM workstation: QAIRT ships no Linux aarch64
+# runtime libraries, so qairt-quantizer cannot collect activation ranges there
+# ("generateActivations: Netrun failure"). An x86_64 runner also has
+# qnn-model-lib-generator, which has no aarch64 build at all, so the context
+# binary can be produced entirely offline.
+#
+# The licensed QAIRT SDK is never stored in this repository. The job downloads
+# it from a private HuggingFace dataset using the HF_TOKEN secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_repo:
+        description: HuggingFace model repo to export
+        required: false
+        default: Qwen/Qwen3-0.6B
+  push:
+    branches: [main]
+    paths:
+      - 'tools/qnn/**'
+      - '.github/workflows/qnn-context.yml'
+
+concurrency:
+  group: qnn-context-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  context-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      QNN_VERSION: "2.50.0.260828"
+      MODEL_REPO: ${{ github.event.inputs.model_repo || 'Qwen/Qwen3-0.6B' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the LLVM C++ runtime and the python toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libc++1 libc++abi1 libstdc++6
+          python3 -m pip install --quiet --upgrade pip
+          # torch is large: keep it in /tmp so it never competes with the
+          # 14 GB runner volume, and do not cache it (a cache hit would still
+          # consume the same volume)
+          python3 -m pip install --quiet --target /tmp/qnn-home \
+            --index-url https://download.pytorch.org/whl/cpu torch
+          python3 -m pip install --quiet --target /tmp/qnn-home \
+            transformers onnx numpy onnxruntime pyyaml packaging setuptools
+          echo "PYTHONPATH=/tmp/qnn-home" >> "$GITHUB_ENV"
+
+      - name: Fetch the QAIRT SDK
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet huggingface_hub
+          python3 - <<'PY'
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+          p = hf_hub_download(repo_id="pocket-workbench/qairt-sdk",
+                              filename="qairt.zip", repo_type="dataset",
+                              token=os.environ["HF_TOKEN"])
+          shutil.copyfile(p, "qairt.zip")
+          print("sdk bytes:", os.path.getsize("qairt.zip"))
+          PY
+          # the runner has ~14 GB: extract only what the chain touches
+          unzip -q qairt.zip \
+            "qairt/${QNN_VERSION}/lib/python/*" \
+            "qairt/${QNN_VERSION}/lib/x86_64-linux-clang/*" \
+            "qairt/${QNN_VERSION}/bin/x86_64-linux-clang/*" \
+            "qairt/${QNN_VERSION}/lib/hexagon-v81/*" \
+            -d sdkroot
+          rm -f qairt.zip
+          df -h .
+          echo "SDKROOT=$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/sdkroot/qairt/${QNN_VERSION}/lib/x86_64-linux-clang" >> "$GITHUB_ENV"
+
+      - name: Export the model to ONNX with standard ops only
+        run: bash tools/qnn/export_model.sh "$MODEL_REPO" model.onnx
+
+      - name: ONNX to DLC for HTP
+        run: |
+          set -euo pipefail
+          python3 tools/qnn/make_dims.py model.onnx dims.txt
+          python3 tools/qnn/onnx_qnn_shim.py \
+            "$SDKROOT/bin/x86_64-linux-clang/qairt-converter" \
+            --input_network "$GITHUB_WORKSPACE/model.onnx" \
+            --output_path "$GITHUB_WORKSPACE/model.dlc" \
+            --target_backend HTP $(cat dims.txt)
+          test -s "$GITHUB_WORKSPACE/model.dlc" || { echo "FATAL: no DLC after conversion"; exit 1; }
+          ls -la "$GITHUB_WORKSPACE/model.dlc"
+          # the fp16 ONNX is 1.6 GB and the DLC 2.9 GB; free the former now
+          rm -f "$GITHUB_WORKSPACE/model.onnx"
+
+      - name: Calibration from a real forward pass
+        run: |
+          set -euo pipefail
+          python3 tools/qnn/make_calibration.py model_dir.txt calib 3 --no-mask
+          cat calib/input_list_0.txt calib/input_list_1.txt calib/input_list_2.txt > calib/all.txt
+          df -h .
+
+      - name: Quantize to int8
+        run: |
+          set -euo pipefail
+          python3 "$SDKROOT/bin/x86_64-linux-clang/qairt-quantizer" \
+            --input_dlc "$GITHUB_WORKSPACE/model.dlc" \
+            --output_dlc "$GITHUB_WORKSPACE/model_int8.dlc" \
+            --input_list "$GITHUB_WORKSPACE/calib/all.txt" \
+            --weights_bitwidth 8 --act_bitwidth 8 --bias_bitwidth 32 \
+            --use_per_channel_quantization
+          ls -la "$GITHUB_WORKSPACE/model_int8.dlc"
+          rm -f "$GITHUB_WORKSPACE/model.dlc"
+
+      - name: DLC to QNN network to hexagon-v81 context binary
+        run: |
+          set -euo pipefail
+          "$SDKROOT/bin/x86_64-linux-clang/qnn-model-lib-generator" \
+            -c "$GITHUB_WORKSPACE/model_int8.dlc" -o "$GITHUB_WORKSPACE/model_int8.so"
+          "$SDKROOT/bin/x86_64-linux-clang/qnn-context-binary-generator" \
+            --backend "$SDKROOT/lib/x86_64-linux-clang/libQairtHtp.so" \
+            --model "$GITHUB_WORKSPACE/model_int8.so" \
+            --binary_file "$GITHUB_WORKSPACE/model_v81.bin" \
+            --target_platform hexagon-v81
+          test -s "$GITHUB_WORKSPACE/model_v81.bin" || { echo "FATAL: no context binary"; exit 1; }
+          ls -la "$GITHUB_WORKSPACE/model_v81.bin"
+          sha256sum "$GITHUB_WORKSPACE/model_v81.bin"
+
+      - name: Upload the context binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qnn-context-${{ github.run_number }}
+          path: model_v81.bin
+          retention-days: 30
