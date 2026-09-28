@@ -9,7 +9,8 @@ name: qnn-context
 # binary can be produced entirely offline.
 #
 # The licensed QAIRT SDK is never stored in this repository. The job downloads
-# it from a private HuggingFace dataset using the HF_TOKEN secret.
+# it from the private HuggingFace dataset Aleinto/qairt-sdk using HF_TOKEN, which
+# should be a read-only token scoped to that dataset.
 
 on:
   workflow_dispatch:
@@ -57,11 +58,17 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
+          # fail loudly rather than silently produce an image without the SDK
+          test -n "$HF_TOKEN" || {
+            echo "FATAL: secret HF_TOKEN is not set. The QAIRT SDK is licensed"
+            echo "material and is not in this repository by design."
+            exit 1
+          }
           python3 -m pip install --quiet huggingface_hub
           python3 - <<'PY'
           import os, shutil
           from huggingface_hub import hf_hub_download
-          p = hf_hub_download(repo_id="pocket-workbench/qairt-sdk",
+          p = hf_hub_download(repo_id="Aleinto/qairt-sdk",
                               filename="qairt.zip", repo_type="dataset",
                               token=os.environ["HF_TOKEN"])
           shutil.copyfile(p, "qairt.zip")
