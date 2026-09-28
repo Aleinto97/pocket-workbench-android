@@ -103,15 +103,15 @@ class MainActivity : Activity() {
             "-n", "32",
             "-r", "1",
         )
-        val pb = ProcessBuilder(cmd)
+        val pb = ProcessBuilder(*cmd)
         // RPCCode finds the HTP skel beside the app's native libraries
-        pb.environment()["LD_LIBRARY_PATH"] = nativeDir.absolutePath
-        pb.environment()["ADSP_LIBRARY_PATH"] =
-            nativeDir.absolutePath + ";/vendor/lib/rfsa/adsp;/dsp"
+        val env: MutableMap<String, String> = pb.environment()
+        env["LD_LIBRARY_PATH"] = nativeDir.absolutePath
+        env["ADSP_LIBRARY_PATH"] = nativeDir.absolutePath + ";/vendor/lib/rfsa/adsp;/dsp"
         say("running --device $device")
         return try {
             val p = pb.start()
-            val text = p.inputStream.bufferedReader().readText()
+            val text: String = p.inputStream.bufferedReader().use { it.readText() }
             p.waitFor()
             say("exit=${p.exitValue()}")
             text
