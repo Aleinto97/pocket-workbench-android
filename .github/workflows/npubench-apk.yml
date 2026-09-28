@@ -26,9 +26,12 @@ jobs:
       - name: Set up the Android SDK and Gradle
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+          # the runner image ships cmdline-tools but not on PATH
+          SDKMANAGER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER" || { echo "sdkmanager not found at $SDKMANAGER"; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+          echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
           curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.11.1-bin.zip
           unzip -q /tmp/gradle.zip -d /opt
           echo "/opt/gradle-8.11.1/bin" >> "$GITHUB_PATH"
