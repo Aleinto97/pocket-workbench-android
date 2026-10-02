@@ -30,7 +30,7 @@ jobs:
         run: bash scripts/fetch-native.sh
       - name: Test and build the Rust engine
         run: |
-          (cd rust/pocketinfer && cargo test --release)
+          (cd rust/pocketinfer && POCKET_SHELL=/bin/sh cargo test --release)
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
           bash scripts/build-rust.sh
       - name: Build

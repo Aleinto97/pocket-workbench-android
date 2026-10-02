@@ -606,10 +606,14 @@ impl Workspace {
         let timeout_ms = call.number("timeout_ms", SHELL_TIMEOUT_MS as i64).max(1000) as u64;
         let started = Instant::now();
         let system = call.optional_text("system").unwrap_or_else(|| "android".to_string());
+        // Overridable for tests: CI runners are not Android and have no
+        // /system/bin/sh. Production always uses the Android shell.
+        let shell_bin =
+            std::env::var("POCKET_SHELL").unwrap_or_else(|_| "/system/bin/sh".to_string());
         let (mut command, cwd_label) = match system.as_str() {
             "linux" => self.linux_command(&command_arg)?,
             "android" => {
-                let mut command = Command::new("/system/bin/sh");
+                let mut command = Command::new(&shell_bin);
                 command
                     .arg("-c")
                     .arg(&command_arg)
@@ -652,7 +656,7 @@ impl Workspace {
         }
         let child = command
             .spawn()
-            .map_err(|e| Error::new(format!("Cannot start the {system} shell: {e}")))?;
+            .map_err(|e| Error::new(format!("Cannot start the {system} shell ({shell_bin}): {e}")))?;
         let pid = child.id() as i32;
         ACTIVE_SHELL.store(pid, Ordering::SeqCst);
         let handle = std::thread::spawn(move || child.wait_with_output());
