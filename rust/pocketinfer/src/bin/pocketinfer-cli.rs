@@ -206,11 +206,16 @@ fn main() {
             let temp: f32 = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(0.0);
             let mode = args.get(6).cloned().unwrap_or_else(|| "direct".into());
             let msgs = vec![pocketinfer::chat::Message { role: "user".into(), content: text }];
-            let mut prompt = pocketinfer::chat::apply_minicpm5(&msgs, true);
-            match mode.as_str() {
-                "direct" => prompt.push_str(pocketinfer::chat::direct_suffix()),
-                "think" => prompt.push_str(pocketinfer::chat::thinking_on_suffix()),
-                _ => {}
+            let family = pocketinfer::chat::family_of(&engine.model.tok_pre(), &engine.model.cfg.name);
+            let mut prompt = pocketinfer::chat::apply_for(family, &msgs, true);
+            // Thinking tags exist only in the minicpm template; other families
+            // must not see them.
+            if family == "minicpm" {
+                match mode.as_str() {
+                    "direct" => prompt.push_str(pocketinfer::chat::direct_suffix()),
+                    "think" => prompt.push_str(pocketinfer::chat::thinking_on_suffix()),
+                    _ => {}
+                }
             }
             eprintln!("mode={mode} temp={temp} prompt={prompt:?}");
             let ids = engine.model.tok.encode(&prompt, true);

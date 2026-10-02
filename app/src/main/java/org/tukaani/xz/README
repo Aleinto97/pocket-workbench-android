@@ -1,0 +1,9 @@
+Vendored XZ decoder (decode path used by LinuxModule for the Debian rootfs).
+
+Source: https://github.com/tukaani-project/xz-java (XZ for Java)
+License: public domain (see COPYING in the upstream repo: "Permission to use,
+copy, modify, and/or distribute this software for any purpose with or without
+fee is hereby granted.").
+
+Vendored instead of depending on org.tukaani:xz from Maven so the app builds
+fully offline: the only consumer is LinuxModule's .tar.xz extraction.

@@ -1,5 +1,7 @@
 #[macro_use]
 pub mod util;
+pub mod agent;
+pub mod agent_jni;
 pub mod backend;
 pub mod chat;
 pub mod forensics;

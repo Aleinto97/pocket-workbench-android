@@ -35,6 +35,11 @@ pub struct Tokenizer {
     pub bos_id: Option<u32>,
     pub eos_ids: Vec<u32>,
     pub n_vocab: usize,
+    /// True when the vocab marks word starts with U+2581 (sentencepiece
+    /// style, e.g. llama-2) instead of U+0120 (GPT-2 style). The byte map
+    /// always produces U+0120 for 0x20, so both directions remap when set.
+    /// Detected per file, so validated GPT-2-style vocabs are untouched.
+    pub spm_space: bool,
 }
 
 impl Tokenizer {
@@ -78,6 +83,10 @@ impl Tokenizer {
         let pre = g.get_str_string("tokenizer.ggml.pre").unwrap_or_default();
         let patterns = patterns_for(&pre);
         let ignore_merges = pre == "minicpm5";
+        // A word-start marker of U+2581 anywhere in the vocab means the BPE
+        // merges were trained on sentencepiece spacing: without remapping,
+        // every encoded word misses its merges and degrades to bytes.
+        let spm_space = tokens.iter().any(|t| t.starts_with(&[0xE2, 0x96, 0x81]));
         let bos_id = g.get_u32("tokenizer.ggml.bos_token_id");
         let mut eos_ids = Vec::new();
         if let Some(e) = g.get_u32("tokenizer.ggml.eos_token_id") {
@@ -105,11 +114,12 @@ impl Tokenizer {
             ignore_merges,
             bos_id,
             eos_ids,
+            spm_space,
         })
     }
 
     fn encode_word(&self, word: &str, out: &mut Vec<u32>) {
-        let encoded: Vec<u8> = {
+        let mut encoded: Vec<u8> = {
             let mut v = Vec::with_capacity(word.len() * 2);
             for b in word.as_bytes() {
                 let mut buf = [0u8; 4];
@@ -117,6 +127,24 @@ impl Tokenizer {
             }
             v
         };
+        // Sentencepiece vocabs train merges on U+2581 word starts, but the
+        // byte map emits U+0120: remap so merges hit and ids match training.
+        if self.spm_space {
+            const G_DOT: [u8; 2] = [0xC4, 0xA0];
+            const SP_MARK: [u8; 3] = [0xE2, 0x96, 0x81];
+            let mut remapped = Vec::with_capacity(encoded.len());
+            let mut i = 0usize;
+            while i < encoded.len() {
+                if encoded[i..].starts_with(&G_DOT) {
+                    remapped.extend_from_slice(&SP_MARK);
+                    i += G_DOT.len();
+                } else {
+                    remapped.push(encoded[i]);
+                    i += 1;
+                }
+            }
+            encoded = remapped;
+        }
         if self.ignore_merges {
             if let Some(id) = self.token_to_id.get(&encoded) {
                 out.push(*id);
@@ -169,7 +197,23 @@ impl Tokenizer {
         }
     }
 
-    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
+    fn encode_plain(&self, text: &str, at_start: bool, out: &mut Vec<u32>) {
+        // Sentencepiece dummy prefix: the input is treated as starting with a
+        // word separator, so a leading "The" encodes as "▁The" exactly like
+        // mid-text " The" does. GPT-2-style vocabs need no prefix (their
+        // regex treats string start the same way). Only the very first plain
+        // segment of the whole input gets it — never text after a special.
+        let prefixed;
+        let text = if at_start
+            && self.spm_space
+            && !text.is_empty()
+            && !text.starts_with(char::is_whitespace)
+        {
+            prefixed = format!(" {text}");
+            &prefixed
+        } else {
+            text
+        };
         let mut words: Vec<String> = vec![text.to_string()];
         for pat in &self.patterns {
             let mut next = Vec::new();
@@ -190,7 +234,7 @@ impl Tokenizer {
     pub fn encode(&self, text: &str, parse_special: bool) -> Vec<u32> {
         let mut out = Vec::new();
         if !parse_special || self.specials.is_empty() {
-            self.encode_plain(text, &mut out);
+            self.encode_plain(text, true, &mut out);
             return out;
         }
         let bytes = text.as_bytes();
@@ -206,7 +250,7 @@ impl Tokenizer {
             }
             if let Some((len, id)) = matched {
                 if plain_start < pos {
-                    self.encode_plain(&text[plain_start..pos], &mut out);
+                    self.encode_plain(&text[plain_start..pos], plain_start == 0, &mut out);
                 }
                 out.push(id);
                 pos += len;
@@ -217,7 +261,7 @@ impl Tokenizer {
             }
         }
         if plain_start < bytes.len() {
-            self.encode_plain(&text[plain_start..], &mut out);
+            self.encode_plain(&text[plain_start..], plain_start == 0, &mut out);
         }
         out
     }
@@ -235,6 +279,12 @@ impl Tokenizer {
         let mut out = Vec::with_capacity(tok.len());
         if let Ok(s) = core::str::from_utf8(tok) {
             for ch in s.chars() {
+                // Mirror of the encode remap: sentencepiece spacing renders
+                // back as a plain space instead of a visible marker.
+                if self.spm_space && ch == '\u{2581}' {
+                    out.push(b' ');
+                    continue;
+                }
                 match self.byte_decoder.get(&ch) {
                     Some(b) => out.push(*b),
                     None => {

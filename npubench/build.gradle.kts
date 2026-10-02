@@ -14,8 +14,8 @@ android {
         versionName = "0.1.0"
         ndk { abiFilters += "arm64-v8a" }
     }
-    // The HTP skel is a shared library, so it must be extracted and installed
-    // by the package manager; extractNativeLibs=false would leave it compressed.
+    // The HTP skel and the benchmark executable must be extracted to the
+    // package manager's executable native library directory.
     packaging { jniLibs.useLegacyPackaging = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -25,10 +25,4 @@ android {
     buildTypes {
         getByName("release") { isMinifyEnabled = false }
     }
-    sourceSets["main"].assets.srcDir(layout.projectDirectory.dir("src/main/assets"))
-}
-
-dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
 }

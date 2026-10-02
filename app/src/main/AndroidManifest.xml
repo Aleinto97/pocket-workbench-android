@@ -1,9 +1,20 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-    <application android:name=".WorkbenchApp" android:allowBackup="false" android:usesCleartextTraffic="false" android:label="Pocket Workbench" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:extractNativeLibs="true">
-        <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <application android:allowBackup="false" android:usesCleartextTraffic="false" android:label="Pocket Workbench" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:extractNativeLibs="true">
+        <!-- The prebuilt llama_cpp plugin links against the vendor OpenCL loader,
+             even for CPU/HTP runs, so the device must expose it. Same declaration
+             npubench uses. -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false"/>
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop" android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
         </activity>
+        <!-- The agent runtime and the resident model live in their own process:
+             same UID, so filesDir stays readable, and a native crash does not
+             take the UI down with it. -->
+        <service android:name=".AgentService" android:exported="false" android:process=":inference" android:foregroundServiceType="dataSync"/>
     </application>
 </manifest>

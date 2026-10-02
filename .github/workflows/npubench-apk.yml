@@ -23,18 +23,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up the Android SDK and Gradle
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Set up the Android SDK
         run: |
           set -euo pipefail
           # the runner image ships cmdline-tools but not on PATH
           SDKMANAGER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
           test -x "$SDKMANAGER" || { echo "sdkmanager not found at $SDKMANAGER"; exit 1; }
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" >/dev/null
           echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
-          curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.11.1-bin.zip
-          unzip -q /tmp/gradle.zip -d /opt
-          echo "/opt/gradle-8.11.1/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Fetch the GenieX runtime
         env:
@@ -43,19 +50,19 @@ jobs:
           set -euo pipefail
           test -n "$HF_TOKEN" || { echo "FATAL: HF_TOKEN secret is not set"; exit 1; }
           bash scripts/fetch-geniex.sh
-          ls -la npubench/src/main/jniLibs/arm64-v8a | tail -3
-          ls -la npubench/src/main/assets
+          test -s npubench/src/main/jniLibs/arm64-v8a/libgeniexbench.so
+          test -s npubench/src/main/jniLibs/arm64-v8a/libgeniexbench_exit.so
 
       - name: Build the APK
-        run: gradle :npubench:assembleRelease --no-daemon --stacktrace
+        run: gradle :npubench:assembleDebug --no-daemon
 
       - name: Report the APK
         run: |
-          ls -la npubench/build/outputs/apk/release/*.apk
-          du -h npubench/build/outputs/apk/release/*.apk
+          ls -la npubench/build/outputs/apk/debug/*.apk
+          du -h npubench/build/outputs/apk/debug/*.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: npubench-apk
-          path: npubench/build/outputs/apk/release/*.apk
+          path: npubench/build/outputs/apk/debug/*.apk
           retention-days: 30

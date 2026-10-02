@@ -29,7 +29,7 @@ static BACKEND_CODE: AtomicI32 = AtomicI32::new(0);
 static HANDLERS: Once = Once::new();
 
 extern "C" {
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn open(path: *const u8, flags: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
     fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
     fn getpid() -> i32;

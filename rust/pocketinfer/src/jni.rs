@@ -5,10 +5,10 @@ use crate::util;
 use core::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-type JObject = *mut c_void;
+pub(crate) type JObject = *mut c_void;
 type JClass = *mut c_void;
 type JMethodId = *mut c_void;
-type JString = *mut c_void;
+pub(crate) type JString = *mut c_void;
 type JArray = *mut c_void;
 
 #[repr(C)]
@@ -36,12 +36,22 @@ const I_GET_ARRAY_LENGTH: usize = 171;
 const I_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
 const I_EXCEPTION_CHECK: usize = 228;
 
-struct Jni {
-    env: *mut *const JniTable,
+pub(crate) struct Jni {
+    pub(crate) env: *mut *const JniTable,
 }
 
 impl Jni {
-    fn table(&self) -> &JniTable {
+    /// Wraps the `JNIEnv*` a native method receives.
+    pub(crate) fn new(env: *mut *const JniTable) -> Self {
+        Self { env }
+    }
+
+    /// Builds a `jstring` from a Rust `str`, encoding it the way JNI expects.
+    pub(crate) fn jstring(&self, value: &str) -> JString {
+        self.new_string_utf(&to_modified_utf8(value.as_bytes()))
+    }
+
+    pub(crate) fn table(&self) -> &JniTable {
         unsafe { &**self.env }
     }
 
@@ -50,7 +60,7 @@ impl Jni {
         unsafe { core::mem::transmute_copy::<usize, F>(&p) }
     }
 
-    fn find_class(&self, name: &str) -> JClass {
+    pub(crate) fn find_class(&self, name: &str) -> JClass {
         let mut c = Vec::with_capacity(name.len() + 1);
         c.extend_from_slice(name.as_bytes());
         c.push(0);
@@ -58,19 +68,19 @@ impl Jni {
         f(self.env, c.as_ptr())
     }
 
-    fn throw_new(&self, class: JClass, msg: &str) {
+    pub(crate) fn throw_new(&self, class: JClass, msg: &str) {
         let c = nul(msg);
         let f: extern "C" fn(*mut *const JniTable, JClass, *const u8) -> i32 =
             self.fn_ptr(I_THROW_NEW);
         f(self.env, class, c.as_ptr());
     }
 
-    fn throw_state(&self, msg: &str) {
+    pub(crate) fn throw_state(&self, msg: &str) {
         let cls = self.find_class("java/lang/IllegalStateException");
         self.throw_new(cls, msg);
     }
 
-    fn exception_check(&self) -> bool {
+    pub(crate) fn exception_check(&self) -> bool {
         let f: extern "C" fn(*mut *const JniTable) -> u8 = self.fn_ptr(I_EXCEPTION_CHECK);
         f(self.env) != 0
     }
@@ -95,14 +105,14 @@ impl Jni {
         f(self.env, obj, mid, args.as_ptr());
     }
 
-    fn new_string_utf(&self, modified_utf8: &[u8]) -> JString {
+    pub(crate) fn new_string_utf(&self, modified_utf8: &[u8]) -> JString {
         let c = nul_bytes(modified_utf8);
         let f: extern "C" fn(*mut *const JniTable, *const u8) -> JString =
             self.fn_ptr(I_NEW_STRING_UTF);
         f(self.env, c.as_ptr())
     }
 
-    fn get_string_utf(&self, s: JString) -> String {
+    pub(crate) fn get_string_utf(&self, s: JString) -> String {
         if s.is_null() {
             return String::new();
         }
@@ -137,13 +147,13 @@ impl Jni {
         f(self.env, a, i as i32)
     }
 
-    fn delete_local(&self, o: JObject) {
+    pub(crate) fn delete_local(&self, o: JObject) {
         let f: extern "C" fn(*mut *const JniTable, JObject) = self.fn_ptr(I_DELETE_LOCAL_REF);
         f(self.env, o);
     }
 }
 
-fn nul(s: &str) -> Vec<u8> {
+pub(crate) fn nul(s: &str) -> Vec<u8> {
     nul_bytes(s.as_bytes())
 }
 
@@ -154,7 +164,7 @@ fn nul_bytes(b: &[u8]) -> Vec<u8> {
     v
 }
 
-fn to_modified_utf8(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn to_modified_utf8(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 8);
     let mut i = 0usize;
     let n = bytes.len();

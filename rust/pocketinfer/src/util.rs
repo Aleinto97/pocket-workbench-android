@@ -138,7 +138,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
 }
 
 extern "C" {
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn open(path: *const u8, flags: i32, ...) -> i32;
     fn close(fd: i32) -> i32;
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> i32;
