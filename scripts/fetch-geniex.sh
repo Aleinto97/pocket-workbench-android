@@ -17,6 +17,13 @@ hf_repo="${HF_REPO:-Aleinto/qairt-sdk}"
 hf_file="${HF_FILE:-geniex-llamacpp-arm64.tar.gz}"
 
 mkdir -p "$libs" "$assets"
+# A validated runtime set may be committed directly (see the branch history):
+# when the libs are already present, keep them instead of downloading the
+# dataset tarball, whose contents may differ from the validated set.
+if ls "$libs"/libgeniexbench.so "$libs"/libgeniex.so >/dev/null 2>&1; then
+  echo "using committed GenieX runtime in $libs"
+  exit 0
+fi
 rm -rf "$libs"/*.so "$assets"/geniex-bench
 
 if [ ! -s "$tarball" ]; then
