@@ -633,7 +633,13 @@ impl Workspace {
                         command.env("PATH", format!("{system_paths}:{}", linux.tools));
                     }
                     _ => {
-                        command.env("PATH", system_paths);
+                        // With a POCKET_SHELL override (CI, not Android) the
+                        // Android paths hold no coreutils: inherit PATH so the
+                        // test shell finds sleep/seq. On device PATH is always
+                        // the Android set above.
+                        if std::env::var("POCKET_SHELL").is_err() {
+                            command.env("PATH", system_paths);
+                        }
                     }
                 }
                 (command, paths::display_relative(&self.root, &self.root))
