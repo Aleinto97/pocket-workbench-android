@@ -28,6 +28,14 @@ jobs:
           gradle-version: '8.11.1'
       - name: Fetch native runtimes (whisper.cpp only)
         run: bash scripts/fetch-native.sh
+      - name: Stage GenieX + Linux runtimes
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          bash scripts/fetch-geniex.sh
+          python3 scripts/package-geniex-runtime.py
+          bash scripts/fetch-linux.sh
+          python3 scripts/package-linux-runtime.py
       - name: Test and build the Rust engine
         run: |
           (cd rust/pocketinfer && POCKET_SHELL=/bin/sh cargo test --release)
